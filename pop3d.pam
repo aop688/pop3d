@@ -1,0 +1,5 @@
+# PAM configuration for pop3d
+# Authentication using system password database
+
+auth    required    pam_unix.so nullok
+account required    pam_unix.so

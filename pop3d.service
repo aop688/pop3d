@@ -1,0 +1,24 @@
+[Unit]
+Description=POP3 Mail Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pop3d -c /etc/pop3d.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pop3d
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/mail
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

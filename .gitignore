@@ -1,3 +1,19 @@
-CVS/
-obj/
-tags
+# Build artifacts
+pop3d
+*.o
+core
+
+# Generated certificates
+*.crt
+*.key
+*.pem
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Testing
+/test_maildir

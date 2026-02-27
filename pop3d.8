@@ -1,90 +1,98 @@
-.\" Copyright (c) Sunil Nimmagadda <sunil@nimmagadda.net>
-.\"
-.\" Permission to use, copy, modify, and distribute this software for any
-.\" purpose with or without fee is hereby granted, provided that the above
-.\" copyright notice and this permission notice appear in all copies.
-.\"
-.\" THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
-.\" WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
-.\" MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
-.\" ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
-.\" WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
-.\" ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
-.\" OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
-.\"
-.Dd $Mdocdate: March 26 2014 $
-.Dt POP3D 8
-.Os
-.Sh NAME
-.Nm pop3d
-.Nd Post Office Protocol (POP3) daemon.
-.Sh SYNOPSIS
-.Nm
-.Op Fl c Ar certfile
-.Op Fl d
-.Op Fl k Ar keyfile
-.Op Fl p Ar path
-.Op Fl t Ar type
-.Sh DESCRIPTION
-.Nm
-daemon implements Post Office Protocol (Version 3) as specified in
-RFC 1939 as well as POP3S and STARTTLS extensions.
-.Pp
-.Nm
-binds to 110(POP3), 995(POP3S) ports and operates on local mailboxes on
-behalf of its remote users.
-.Pp
-The options are as follows:
-.Bl -tag -width Ds
-.It Fl c Ar certfile
-Specify the certificate file. Defaults to /etc/ssl/server.crt.
-.It Fl d
-Do not daemonize. If this option is specified,
-.Nm
-will run in foreground and log to
-.Em stderr .
-.It Fl k Ar keyfile
-Specify the key file. Defaults to /etc/ssl/private/server.key.
-.It Fl p
-Path to the maildrop. Defaults to /var/mail/%u in case of mbox and
-~/Maildir in case of maildir.
-.Nm
-expands '~' to user's home dir
-and '%u' to user's name if specified in the path.
-.It Fl t
-Specify maildrop type. Options are mbox and maildir. Defaults to mbox.
-.El
-.Sh FILES
-.Bl -tag -width Ds -compact
-.It Pa ~/maildir
-.It Pa /var/mail/%u
-User maildrops
-.El
-.Sh SEE ALSO
-.Xr smtpd 8 ,
-.Xr ssl 8
-.Sh STANDARDS
-.Rs
-.%A J. Myers
-.%A M. Rose
-.%D May 1996
-.%R RFC 1939
-.%T Post Office Protocol \(en Version 3
-.Re
-.Pp
-.Rs
-.%A C. Newman
-.%D June 1999
-.%R RFC 2595
-.%T Using TLS with IMAP, POP3 and ACAP
-.Re
-.Pp
-.Rs
-.%A A. Melnikov
-.%A C. Newman
-.%A M. Yevstifeyev
-.%D August 2011
-.%R draft-melnikov-pop3-over-tls-02
-.Re
-.Sh CAVEATS
-POP3 authenticates using cleartext passwords on 110(POP3) port.
+.TH POP3D 8 "February 2024" "pop3d" "System Administration"
+.SH NAME
+pop3d \- POP3 mail server
+.SH SYNOPSIS
+.B pop3d
+.RB [ \-c \fIfile\fP ]
+.RB [ \-d ]
+.RB [ \-g ]
+.RB [ \-h ]
+.SH DESCRIPTION
+.B pop3d
+is a POP3 mail server supporting both plaintext and SSL/TLS connections.
+It uses PAM or shadow password authentication and stores mail in maildir format.
+.PP
+The server listens on two ports:
+.IP \(bu 2
+Port 110 \- POP3 with optional STARTTLS
+.IP \(bu 2
+Port 995 \- POP3S (SSL/TLS)
+.SH OPTIONS
+.TP
+.BI \-c \ file
+Use the specified configuration file instead of the default
+.IR /etc/pop3d.conf .
+.TP
+.B \-d
+Run in the foreground (do not daemonize). Useful for debugging.
+.TP
+.B \-g
+Generate a self-signed SSL certificate and exit.
+.TP
+.B \-h
+Display usage information and exit.
+.SH CONFIGURATION
+The configuration file uses a simple key=value format.
+See
+.IR pop3d.conf (5)
+for details.
+.SS Authentication
+.B pop3d
+supports two authentication methods:
+.IP 1. 3
+PAM (preferred) - Uses the system PAM configuration
+.IP 2. 3
+Shadow passwords - Direct /etc/shadow access
+.SH FILES
+.TP
+.I /etc/pop3d.conf
+Default configuration file
+.TP
+.I /etc/pam.d/pop3d
+PAM configuration file
+.TP
+.I /etc/ssl/certs/pop3d.crt
+Default SSL certificate
+.TP
+.I /etc/ssl/private/pop3d.key
+Default SSL private key
+.TP
+.I /var/mail
+Default mail storage directory
+.SH EXAMPLES
+Start the server:
+.PP
+.nf
+.RS
+sudo systemctl start pop3d
+.RE
+.fi
+.PP
+Generate a new certificate:
+.PP
+.nf
+.RS
+sudo pop3d -g
+.RE
+.fi
+.PP
+Test with OpenSSL:
+.PP
+.nf
+.RS
+openssl s_client -connect localhost:995 -quiet
+.RE
+.fi
+.SH SEE ALSO
+.BR pop3d.conf (5),
+.BR pam (8),
+.BR openssl (1),
+.BR smtpd (8)
+.SH AUTHORS
+Originally written by Sunil Nimmagadda.
+Production version adapted for Linux with PAM authentication.
+.SH SECURITY
+Always use SSL/TLS in production by setting
+.B allow_plaintext = 0
+in the configuration file.
+Monitor logs for authentication failures and consider using fail2ban.
