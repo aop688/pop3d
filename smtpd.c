@@ -258,7 +258,7 @@ static int deliver_to_maildir(const char *user, int fd, const char *data_path)
         snprintf(tmp_path, sizeof(tmp_path), "%s/tmp/%s", maildir, new_path);
         snprintf(dest_path, sizeof(dest_path), "%s/new/%s", maildir, new_path);
         
-        dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
         if (dst_fd >= 0) {
             break;  /* Success */
         }
@@ -531,7 +531,7 @@ static void handle_data(SmtpClient *client)
     }
     
     snprintf(client->data_path, sizeof(client->data_path),
-             "/tmp/smtpd.XXXXXX");
+             "/var/tmp/smtpd.XXXXXX");
     
     client->data_fd = mkstemp(client->data_path);
     if (client->data_fd < 0) {
@@ -565,7 +565,7 @@ static void handle_data_content(SmtpClient *client, const char *line)
         }
         
         char final_path[PATH_MAX];
-        snprintf(final_path, sizeof(final_path), "/tmp/smtpd.final.XXXXXX");
+        snprintf(final_path, sizeof(final_path), "/var/tmp/smtpd.final.XXXXXX");
         int final_fd = mkstemp(final_path);
         if (final_fd < 0) {
             send_response(&client->base,
@@ -671,30 +671,39 @@ static void handle_rset(SmtpClient *client)
 
 static void handle_auth_plain(SmtpClient *client, const char *params)
 {
-    char decoded[256];
+    unsigned char decoded[256];
     char *username = NULL;
     char *password = NULL;
+    int len = 0;
     
     if (params) {
-        int len = EVP_DecodeBlock((unsigned char *)decoded,
-                                  (unsigned char *)params, strlen(params));
-        if (len > 0) {
-            decoded[len] = '\0';
-            char *p = decoded;
-            while (*p) p++;
-            p++;
-            username = p;
-            while (*p) p++;
-            p++;
-            password = p;
+        /* EVP_DecodeBlock returns the length of the decoded data */
+        int ret = EVP_DecodeBlock(decoded, (const unsigned char *)params, strlen(params));
+        if (ret > 0 && ret < (int)sizeof(decoded)) {
+            decoded[ret] = '\0';
+            /* AUTH PLAIN format: [authzid]\0authcid\0password */
+            /* Skip authzid (authorization identity) if present */
+            int i = 0;
+            while (i < ret && decoded[i] != '\0') i++;  /* Skip authzid */
+            if (i < ret) {
+                i++;  /* Skip the null byte */
+                username = (char *)&decoded[i];
+                while (i < ret && decoded[i] != '\0') i++;  /* Skip authcid */
+                if (i < ret) {
+                    i++;  /* Skip the null byte */
+                    password = (char *)&decoded[i];
+                    len = ret;
+                }
+            }
         }
     }
     
-    if (username && password) {
+    if (username && password && len > 0) {
         if (authenticate_user(username, password, g_ctx.service_name)) {
             client->base.authenticated = 1;
             strncpy(client->base.username, username,
                     sizeof(client->base.username) - 1);
+            client->base.username[sizeof(client->base.username) - 1] = '\0';
             send_response(&client->base,
                           "235 2.7.0 Authentication successful\r\n");
             log_connection("AUTH PLAIN success",
@@ -709,6 +718,9 @@ static void handle_auth_plain(SmtpClient *client, const char *params)
         send_response(&client->base,
                       "501 5.5.4 Syntax error in parameters\r\n");
     }
+    
+    /* Clear sensitive data from stack */
+    memset(decoded, 0, sizeof(decoded));
 }
 
 static void handle_auth(SmtpClient *client, const char *arg)
@@ -725,6 +737,11 @@ static void handle_auth(SmtpClient *client, const char *arg)
     }
     
     char *mech = strdup(arg);
+    if (!mech) {
+        send_response(&client->base, "451 4.3.0 Local error in processing\r\n");
+        return;
+    }
+    
     char *params = strchr(mech, ' ');
     if (params) {
         *params = '\0';
@@ -738,8 +755,8 @@ static void handle_auth(SmtpClient *client, const char *arg)
         if (!params) {
             client->auth_login_state = 1;
         }
-        send_response(&client->base, "334 VXNlcm5hbWU6\r\n");
         free(mech);
+        send_response(&client->base, "334 VXNlcm5hbWU6\r\n");
         return;
     } else {
         send_response(&client->base,
@@ -751,45 +768,63 @@ static void handle_auth(SmtpClient *client, const char *arg)
 
 static void handle_auth_login_user(SmtpClient *client, const char *line)
 {
-    char decoded[256];
-    int len = EVP_DecodeBlock((unsigned char *)decoded,
-                              (unsigned char *)line, strlen(line));
-    if (len > 0) {
+    unsigned char decoded[256];
+    int len = EVP_DecodeBlock(decoded, (const unsigned char *)line, strlen(line));
+    if (len > 0 && len < (int)sizeof(decoded)) {
+        /* Ensure null termination - EVP_DecodeBlock may produce binary output */
         decoded[len] = '\0';
-        strncpy(client->base.username, decoded,
-                sizeof(client->base.username) - 1);
-        client->base.username[sizeof(client->base.username) - 1] = '\0';
-        send_response(&client->base, "334 UGFzc3dvcmQ6\r\n");
-    } else {
-        send_response(&client->base,
-                      "501 5.5.4 Syntax error in parameters\r\n");
-    }
-}
-
-static void handle_auth_login_pass(SmtpClient *client, const char *line)
-{
-    char decoded[256];
-    int len = EVP_DecodeBlock((unsigned char *)decoded,
-                              (unsigned char *)line, strlen(line));
-    if (len > 0) {
-        decoded[len] = '\0';
-        if (authenticate_user(client->base.username, decoded,
-                              g_ctx.service_name)) {
-            client->base.authenticated = 1;
-            send_response(&client->base,
-                          "235 2.7.0 Authentication successful\r\n");
-            log_connection("AUTH LOGIN success",
-                           client->base.client_ip, client->base.socket);
+        /* Find actual string length in case of embedded nulls */
+        int actual_len = 0;
+        while (actual_len < len && decoded[actual_len] != '\0') actual_len++;
+        
+        if (actual_len > 0 && (size_t)actual_len < sizeof(client->base.username)) {
+            memcpy(client->base.username, decoded, actual_len);
+            client->base.username[actual_len] = '\0';
+            send_response(&client->base, "334 UGFzc3dvcmQ6\r\n");
         } else {
             send_response(&client->base,
-                          "535 5.7.8 Authentication credentials invalid\r\n");
-            log_security("AUTH LOGIN failed",
-                         client->base.client_ip, client->base.username);
+                          "501 5.5.4 Syntax error in parameters\r\n");
         }
     } else {
         send_response(&client->base,
                       "501 5.5.4 Syntax error in parameters\r\n");
     }
+    memset(decoded, 0, sizeof(decoded));
+}
+
+static void handle_auth_login_pass(SmtpClient *client, const char *line)
+{
+    unsigned char decoded[256];
+    int len = EVP_DecodeBlock(decoded, (const unsigned char *)line, strlen(line));
+    if (len > 0 && len < (int)sizeof(decoded)) {
+        decoded[len] = '\0';
+        /* Find actual string length in case of embedded nulls */
+        int actual_len = 0;
+        while (actual_len < len && decoded[actual_len] != '\0') actual_len++;
+        
+        if (actual_len > 0) {
+            if (authenticate_user(client->base.username, (const char *)decoded,
+                                  g_ctx.service_name)) {
+                client->base.authenticated = 1;
+                send_response(&client->base,
+                              "235 2.7.0 Authentication successful\r\n");
+                log_connection("AUTH LOGIN success",
+                               client->base.client_ip, client->base.socket);
+            } else {
+                send_response(&client->base,
+                              "535 5.7.8 Authentication credentials invalid\r\n");
+                log_security("AUTH LOGIN failed",
+                             client->base.client_ip, client->base.username);
+            }
+        } else {
+            send_response(&client->base,
+                          "501 5.5.4 Syntax error in parameters\r\n");
+        }
+    } else {
+        send_response(&client->base,
+                      "501 5.5.4 Syntax error in parameters\r\n");
+    }
+    memset(decoded, 0, sizeof(decoded));
 }
 
 static void handle_starttls(SmtpClient *client)

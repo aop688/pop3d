@@ -394,7 +394,7 @@ int parse_email_address(const char *addr, char *user, size_t user_size,
                         char *domain, size_t domain_size)
 {
     const char *at;
-    size_t ulen;
+    size_t ulen, dlen;
     
     if (!addr || !user || !domain)
         return -1;
@@ -407,14 +407,15 @@ int parse_email_address(const char *addr, char *user, size_t user_size,
     if (ulen == 0 || ulen >= user_size)
         return -1;
     
-    if (strlen(at + 1) == 0 || strlen(at + 1) >= domain_size)
+    dlen = strlen(at + 1);
+    if (dlen == 0 || dlen >= domain_size)
         return -1;
     
-    strncpy(user, addr, ulen);
+    memcpy(user, addr, ulen);
     user[ulen] = '\0';
     
-    strncpy(domain, at + 1, domain_size - 1);
-    domain[domain_size - 1] = '\0';
+    memcpy(domain, at + 1, dlen);
+    domain[dlen] = '\0';
     
     return 0;
 }

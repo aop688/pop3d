@@ -146,10 +146,15 @@ static int count_lines(const char *path)
     if (!fp) return 0;
     
     int lines = 0;
-    int ch;
-    while ((ch = fgetc(fp)) != EOF) {
-        if (ch == '\n') lines++;
+    char buffer[4096];
+    size_t n;
+    
+    while ((n = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        for (size_t i = 0; i < n; i++) {
+            if (buffer[i] == '\n') lines++;
+        }
     }
+    
     fclose(fp);
     return lines;
 }
@@ -234,6 +239,10 @@ static int load_maildir(Pop3Client *client)
         if (!msg) continue;
         
         msg->filename = strdup(dp->d_name);
+        if (!msg->filename) {
+            free(msg);
+            continue;
+        }
         msg->size = st.st_size;
         msg->nlines = count_lines(full_path);
         msg->flags = 0;
@@ -625,9 +634,8 @@ static void handle_top(Pop3Client *client, const char *arg)
     free(msg_str);
     send_response(&client->base, "+OK Top of message follows\r\n");
     
-    while (fgets(line, sizeof(line), fp) && lines_sent <= nlines) {
+    while (fgets(line, sizeof(line), fp) && lines_sent < nlines) {
         if (!in_headers) {
-            if (lines_sent >= nlines) break;
             lines_sent++;
         } else if (line[0] == '\n' || (line[0] == '\r' && line[1] == '\n')) {
             in_headers = 0;
