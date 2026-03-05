@@ -227,20 +227,41 @@ int init_ssl(const char *cert_file, const char *key_file)
         return -1;
     }
     
+    /* Set minimum TLS version to 1.2 for security */
     SSL_CTX_set_min_proto_version(g_ctx.ssl_ctx, TLS1_2_VERSION);
     SSL_CTX_set_options(g_ctx.ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
                         SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
     
+    /* Disable compression to prevent CRIME attack */
+    SSL_CTX_set_options(g_ctx.ssl_ctx, SSL_OP_NO_COMPRESSION);
+    
+    /* Load certificate */
     if (SSL_CTX_use_certificate_file(g_ctx.ssl_ctx, cert_file, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        log_error("Could not load certificate file: %s", cert_file);
+        unsigned long err = ERR_get_error();
+        char err_buf[256];
+        ERR_error_string_n(err, err_buf, sizeof(err_buf));
+        log_error("Could not load certificate file %s: %s", cert_file, err_buf);
         fprintf(stderr, "Warning: Could not load certificate file: %s\n", cert_file);
+        /* Continue anyway - might be using self-signed cert generation later */
     }
     
+    /* Load private key */
     if (SSL_CTX_use_PrivateKey_file(g_ctx.ssl_ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
-        ERR_print_errors_fp(stderr);
-        log_error("Could not load private key file: %s", key_file);
+        unsigned long err = ERR_get_error();
+        char err_buf[256];
+        ERR_error_string_n(err, err_buf, sizeof(err_buf));
+        log_error("Could not load private key file %s: %s", key_file, err_buf);
         fprintf(stderr, "Warning: Could not load private key file: %s\n", key_file);
+        /* Continue anyway - might be using self-signed cert generation later */
+    }
+    
+    /* Verify that the private key matches the certificate */
+    if (SSL_CTX_check_private_key(g_ctx.ssl_ctx) <= 0) {
+        unsigned long err = ERR_get_error();
+        char err_buf[256];
+        ERR_error_string_n(err, err_buf, sizeof(err_buf));
+        log_error("Private key does not match certificate: %s", err_buf);
+        fprintf(stderr, "Warning: Private key does not match certificate\n");
     }
     
     return 0;
@@ -827,6 +848,58 @@ void server_shutdown(MailServer *server)
 }
 
 /* ============================================================================
+ * Configuration validation
+ * ============================================================================ */
+static void validate_config(void)
+{
+    /* Clamp max_connections to valid range */
+    if (g_config.max_connections < 1)
+        g_config.max_connections = 1;
+    if (g_config.max_connections > 1000)
+        g_config.max_connections = 1000;
+    
+    /* Clamp timeouts to reasonable values */
+    if (g_config.timeout_login < 10)
+        g_config.timeout_login = 10;
+    if (g_config.timeout_login > 3600)
+        g_config.timeout_login = 3600;
+    
+    if (g_config.timeout_command < 30)
+        g_config.timeout_command = 30;
+    if (g_config.timeout_command > 3600)
+        g_config.timeout_command = 3600;
+    
+    if (g_config.timeout_data < 60)
+        g_config.timeout_data = 60;
+    if (g_config.timeout_data > 7200)
+        g_config.timeout_data = 7200;
+    
+    /* Clamp max_msg_size to reasonable range (1KB to 100MB) */
+    if (g_config.max_msg_size < 1024)
+        g_config.max_msg_size = 1024;
+    if (g_config.max_msg_size > 100 * 1024 * 1024)
+        g_config.max_msg_size = 100 * 1024 * 1024;
+    
+    /* Validate port numbers */
+    if (g_config.pop3_port < 1 || g_config.pop3_port > 65535)
+        g_config.pop3_port = 110;
+    if (g_config.pop3s_port < 1 || g_config.pop3s_port > 65535)
+        g_config.pop3s_port = 995;
+    if (g_config.smtp_port < 1 || g_config.smtp_port > 65535)
+        g_config.smtp_port = 25;
+    if (g_config.submission_port < 1 || g_config.submission_port > 65535)
+        g_config.submission_port = 587;
+    if (g_config.smtps_port < 1 || g_config.smtps_port > 65535)
+        g_config.smtps_port = 465;
+    
+    /* Ensure hostname is not empty */
+    if (g_config.hostname[0] == '\0') {
+        strncpy(g_config.hostname, "localhost", sizeof(g_config.hostname) - 1);
+        g_config.hostname[sizeof(g_config.hostname) - 1] = '\0';
+    }
+}
+
+/* ============================================================================
  * Configuration parsing
  * ============================================================================ */
 int parse_config(const char *filename)
@@ -837,6 +910,7 @@ int parse_config(const char *filename)
     
     if (!fp) {
         /* Config file is optional - use defaults */
+        validate_config();
         return 0;
     }
     
@@ -863,7 +937,9 @@ int parse_config(const char *filename)
         if (strcmp(key, "allow_plaintext") == 0) {
             g_config.allow_plaintext = atoi(value);
         } else if (strcmp(key, "max_connections") == 0) {
-            g_config.max_connections = atoi(value);
+            int mc = atoi(value);
+            if (mc >= 1 && mc <= 1000)
+                g_config.max_connections = mc;
         } else if (strcmp(key, "log_auth") == 0) {
             g_config.log_auth = atoi(value);
         } else if (strcmp(key, "ipv6_enabled") == 0) {
@@ -886,25 +962,37 @@ int parse_config(const char *filename)
         }
         /* POP3 settings */
         else if (strcmp(key, "pop3_port") == 0) {
-            g_config.pop3_port = atoi(value);
+            int port = atoi(value);
+            if (port >= 1 && port <= 65535)
+                g_config.pop3_port = port;
         } else if (strcmp(key, "pop3s_port") == 0) {
-            g_config.pop3s_port = atoi(value);
+            int port = atoi(value);
+            if (port >= 1 && port <= 65535)
+                g_config.pop3s_port = port;
         } else if (strcmp(key, "pop3_enabled") == 0) {
             g_config.pop3_enabled = atoi(value);
         }
         /* SMTP settings */
         else if (strcmp(key, "smtp_port") == 0) {
-            g_config.smtp_port = atoi(value);
+            int port = atoi(value);
+            if (port >= 1 && port <= 65535)
+                g_config.smtp_port = port;
         } else if (strcmp(key, "submission_port") == 0) {
-            g_config.submission_port = atoi(value);
+            int port = atoi(value);
+            if (port >= 1 && port <= 65535)
+                g_config.submission_port = port;
         } else if (strcmp(key, "smtps_port") == 0) {
-            g_config.smtps_port = atoi(value);
+            int port = atoi(value);
+            if (port >= 1 && port <= 65535)
+                g_config.smtps_port = port;
         } else if (strcmp(key, "smtp_enabled") == 0) {
             g_config.smtp_enabled = atoi(value);
         } else if (strcmp(key, "require_auth") == 0) {
             g_config.require_auth = atoi(value);
         } else if (strcmp(key, "max_msg_size") == 0) {
-            g_config.max_msg_size = strtoul(value, NULL, 10);
+            size_t size = strtoul(value, NULL, 10);
+            if (size >= 1024 && size <= 100 * 1024 * 1024)
+                g_config.max_msg_size = size;
         } else if (strcmp(key, "hostname") == 0) {
             strncpy(g_config.hostname, value, sizeof(g_config.hostname) - 1);
             g_config.hostname[sizeof(g_config.hostname) - 1] = '\0';
@@ -914,6 +1002,7 @@ int parse_config(const char *filename)
     }
     
     fclose(fp);
+    validate_config();
     return 0;
 }
 
@@ -973,6 +1062,177 @@ void setup_signal_handlers(void)
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
+}
+
+/* ============================================================================
+ * Certificate generation - Compatible with OpenSSL 1.0+ and 3.0+
+ * ============================================================================ */
+int generate_self_signed_cert(const char *cert_file, const char *key_file,
+                               const char *cn_name)
+{
+    EVP_PKEY *pkey = NULL;
+    X509 *x509 = NULL;
+    X509_NAME *name = NULL;
+    FILE *fp = NULL;
+    int ret = -1;
+    
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    /* OpenSSL 3.0+ - Use EVP API */
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (!ctx) {
+        log_error("EVP_PKEY_CTX_new_id failed");
+        return -1;
+    }
+    
+    if (EVP_PKEY_keygen_init(ctx) <= 0) {
+        log_error("EVP_PKEY_keygen_init failed");
+        EVP_PKEY_CTX_free(ctx);
+        return -1;
+    }
+    
+    if (EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0) {
+        log_error("EVP_PKEY_CTX_set_rsa_keygen_bits failed");
+        EVP_PKEY_CTX_free(ctx);
+        return -1;
+    }
+    
+    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
+        log_error("EVP_PKEY_keygen failed");
+        EVP_PKEY_CTX_free(ctx);
+        return -1;
+    }
+    EVP_PKEY_CTX_free(ctx);
+#else
+    /* OpenSSL 1.x - Use legacy RSA API */
+    RSA *rsa = RSA_new();
+    BIGNUM *bn = NULL;
+    
+    if (!rsa) {
+        log_error("RSA_new failed");
+        return -1;
+    }
+    
+    bn = BN_new();
+    if (!bn || !BN_set_word(bn, RSA_F4)) {
+        log_error("BN_set_word failed");
+        BN_free(bn);
+        RSA_free(rsa);
+        return -1;
+    }
+    
+    if (!RSA_generate_key_ex(rsa, 2048, bn, NULL)) {
+        log_error("RSA_generate_key_ex failed");
+        BN_free(bn);
+        RSA_free(rsa);
+        return -1;
+    }
+    BN_free(bn);
+    
+    pkey = EVP_PKEY_new();
+    if (!pkey || !EVP_PKEY_assign_RSA(pkey, rsa)) {
+        log_error("EVP_PKEY_assign_RSA failed");
+        EVP_PKEY_free(pkey);
+        RSA_free(rsa);
+        return -1;
+    }
+    /* rsa is now owned by pkey */
+#endif
+    
+    /* Create certificate */
+    x509 = X509_new();
+    if (!x509) {
+        log_error("X509_new failed");
+        goto cleanup;
+    }
+    
+    /* Set version to X509v3 */
+    X509_set_version(x509, 2);
+    
+    /* Set serial number */
+    ASN1_INTEGER_set(X509_get_serialNumber(x509), (long)time(NULL));
+    
+    /* Set validity period */
+    X509_gmtime_adj(X509_get_notBefore(x509), 0);
+    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);  /* 1 year */
+    
+    /* Set public key */
+    X509_set_pubkey(x509, pkey);
+    
+    /* Set subject name */
+    name = X509_get_subject_name(x509);
+    X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (const unsigned char *)"US", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC, (const unsigned char *)"MailD Server", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, 
+                               (unsigned char *)(cn_name ? cn_name : "localhost"), -1, -1, 0);
+    
+    /* Set issuer (self-signed) */
+    X509_set_issuer_name(x509, name);
+    
+    /* Add extensions */
+    X509V3_CTX ext_ctx;
+    X509V3_set_ctx_nodb(&ext_ctx);
+    X509V3_set_ctx(&ext_ctx, x509, x509, NULL, NULL, 0);
+    
+    X509_EXTENSION *ext = X509V3_EXT_conf_nid(NULL, &ext_ctx, NID_basic_constraints, "CA:FALSE");
+    if (ext) {
+        X509_add_ext(x509, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+    
+    ext = X509V3_EXT_conf_nid(NULL, &ext_ctx, NID_key_usage, "digitalSignature,keyEncipherment");
+    if (ext) {
+        X509_add_ext(x509, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+    
+    ext = X509V3_EXT_conf_nid(NULL, &ext_ctx, NID_ext_key_usage, "serverAuth");
+    if (ext) {
+        X509_add_ext(x509, ext, -1);
+        X509_EXTENSION_free(ext);
+    }
+    
+    /* Sign the certificate */
+    if (!X509_sign(x509, pkey, EVP_sha256())) {
+        log_error("X509_sign failed");
+        goto cleanup;
+    }
+    
+    /* Write private key to file */
+    fp = fopen(key_file, "w");
+    if (!fp) {
+        log_error("Cannot open key file for writing: %s", key_file);
+        goto cleanup;
+    }
+    if (!PEM_write_PrivateKey(fp, pkey, NULL, NULL, 0, NULL, NULL)) {
+        log_error("PEM_write_PrivateKey failed");
+        fclose(fp);
+        goto cleanup;
+    }
+    fclose(fp);
+    
+    /* Write certificate to file */
+    fp = fopen(cert_file, "w");
+    if (!fp) {
+        log_error("Cannot open cert file for writing: %s", cert_file);
+        goto cleanup;
+    }
+    if (!PEM_write_X509(fp, x509)) {
+        log_error("PEM_write_X509 failed");
+        fclose(fp);
+        goto cleanup;
+    }
+    fclose(fp);
+    
+    /* Set appropriate permissions for key file */
+    chmod(key_file, 0600);
+    
+    ret = 0;
+    log_connection("Generated self-signed certificate", cn_name ? cn_name : "localhost", 0);
+
+cleanup:
+    if (x509) X509_free(x509);
+    if (pkey) EVP_PKEY_free(pkey);
+    return ret;
 }
 
 /* ============================================================================

@@ -530,8 +530,12 @@ static void handle_data(SmtpClient *client)
         return;
     }
     
+    /* Use proper temp directory from environment or default to /tmp */
+    const char *tmpdir = getenv("TMPDIR");
+    if (!tmpdir) tmpdir = "/tmp";
+    
     snprintf(client->data_path, sizeof(client->data_path),
-             "/var/tmp/smtpd.XXXXXX");
+             "%s/smtpd.XXXXXX", tmpdir);
     
     client->data_fd = mkstemp(client->data_path);
     if (client->data_fd < 0) {
@@ -541,6 +545,7 @@ static void handle_data(SmtpClient *client)
         return;
     }
     
+    /* Unlink immediately so file is cleaned up on close/crash */
     unlink(client->data_path);
     
     client->state = STATE_DATA;
@@ -565,7 +570,9 @@ static void handle_data_content(SmtpClient *client, const char *line)
         }
         
         char final_path[PATH_MAX];
-        snprintf(final_path, sizeof(final_path), "/var/tmp/smtpd.final.XXXXXX");
+        const char *tmpdir = getenv("TMPDIR");
+        if (!tmpdir) tmpdir = "/tmp";
+        snprintf(final_path, sizeof(final_path), "%s/smtpd.final.XXXXXX", tmpdir);
         int final_fd = mkstemp(final_path);
         if (final_fd < 0) {
             send_response(&client->base,
@@ -669,6 +676,29 @@ static void handle_rset(SmtpClient *client)
     send_response(&client->base, "250 2.0.0 Ok\r\n");
 }
 
+/* Helper function to decode base64 with proper padding handling */
+static int base64_decode(const char *input, unsigned char *output, int output_len)
+{
+    int input_len = strlen(input);
+    int padding = 0;
+    
+    /* Count padding characters */
+    if (input_len >= 2) {
+        if (input[input_len - 1] == '=') padding++;
+        if (input[input_len - 2] == '=') padding++;
+    }
+    
+    int ret = EVP_DecodeBlock(output, (const unsigned char *)input, input_len);
+    if (ret < 0) return -1;
+    
+    /* Adjust for padding */
+    ret -= padding;
+    if (ret >= output_len) ret = output_len - 1;
+    if (ret > 0) output[ret] = '\0';
+    
+    return ret;
+}
+
 static void handle_auth_plain(SmtpClient *client, const char *params)
 {
     unsigned char decoded[256];
@@ -677,10 +707,9 @@ static void handle_auth_plain(SmtpClient *client, const char *params)
     int len = 0;
     
     if (params) {
-        /* EVP_DecodeBlock returns the length of the decoded data */
-        int ret = EVP_DecodeBlock(decoded, (const unsigned char *)params, strlen(params));
-        if (ret > 0 && ret < (int)sizeof(decoded)) {
-            decoded[ret] = '\0';
+        /* Use safe base64 decoding with padding handling */
+        int ret = base64_decode(params, decoded, sizeof(decoded));
+        if (ret > 0) {
             /* AUTH PLAIN format: [authzid]\0authcid\0password */
             /* Skip authzid (authorization identity) if present */
             int i = 0;
@@ -769,11 +798,10 @@ static void handle_auth(SmtpClient *client, const char *arg)
 static void handle_auth_login_user(SmtpClient *client, const char *line)
 {
     unsigned char decoded[256];
-    int len = EVP_DecodeBlock(decoded, (const unsigned char *)line, strlen(line));
-    if (len > 0 && len < (int)sizeof(decoded)) {
-        /* Ensure null termination - EVP_DecodeBlock may produce binary output */
+    int len = base64_decode(line, decoded, sizeof(decoded));
+    if (len > 0) {
+        /* Ensure null termination and find actual string length */
         decoded[len] = '\0';
-        /* Find actual string length in case of embedded nulls */
         int actual_len = 0;
         while (actual_len < len && decoded[actual_len] != '\0') actual_len++;
         
@@ -795,8 +823,8 @@ static void handle_auth_login_user(SmtpClient *client, const char *line)
 static void handle_auth_login_pass(SmtpClient *client, const char *line)
 {
     unsigned char decoded[256];
-    int len = EVP_DecodeBlock(decoded, (const unsigned char *)line, strlen(line));
-    if (len > 0 && len < (int)sizeof(decoded)) {
+    int len = base64_decode(line, decoded, sizeof(decoded));
+    if (len > 0) {
         decoded[len] = '\0';
         /* Find actual string length in case of embedded nulls */
         int actual_len = 0;

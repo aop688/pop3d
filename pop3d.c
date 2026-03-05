@@ -159,6 +159,20 @@ static int count_lines(const char *path)
     return lines;
 }
 
+/* Safe string copy helper */
+static void safe_strcpy(char *dest, size_t dest_size, const char *src)
+{
+    if (dest_size == 0) return;
+    if (src) {
+        size_t len = strlen(src);
+        if (len >= dest_size) len = dest_size - 1;
+        memcpy(dest, src, len);
+        dest[len] = '\0';
+    } else {
+        dest[0] = '\0';
+    }
+}
+
 static int move_new_to_cur(const char *maildir)
 {
     char new_path[PATH_MAX], cur_path[PATH_MAX];
@@ -210,8 +224,10 @@ static int load_maildir(Pop3Client *client)
     struct dirent *dp;
     struct stat st;
     Message **msgs = NULL;
+    Message **new_msgs = NULL;
     size_t count = 0;
     size_t total_size = 0;
+    size_t capacity = 0;
     
     free_maildrop(client);
     move_new_to_cur(client->maildir_path);
@@ -235,6 +251,18 @@ static int load_maildir(Pop3Client *client)
         if (stat(full_path, &st) < 0)
             continue;
         
+        /* Grow array if needed */
+        if (count >= capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 16;
+            new_msgs = realloc(msgs, new_capacity * sizeof(Message *));
+            if (!new_msgs) {
+                log_error("Failed to allocate memory for message list");
+                continue;
+            }
+            msgs = new_msgs;
+            capacity = new_capacity;
+        }
+        
         Message *msg = calloc(1, sizeof(Message));
         if (!msg) continue;
         
@@ -247,13 +275,6 @@ static int load_maildir(Pop3Client *client)
         msg->nlines = count_lines(full_path);
         msg->flags = 0;
         
-        Message **new_msgs = realloc(msgs, (count + 1) * sizeof(Message *));
-        if (!new_msgs) {
-            free(msg->filename);
-            free(msg);
-            continue;
-        }
-        msgs = new_msgs;
         msgs[count++] = msg;
         total_size += msg->size;
     }
@@ -306,8 +327,7 @@ static void handle_user(Pop3Client *client, const char *username)
         return;
     }
     
-    strncpy(client->base.username, username, sizeof(client->base.username) - 1);
-    client->base.username[sizeof(client->base.username) - 1] = '\0';
+    safe_strcpy(client->base.username, sizeof(client->base.username), username);
     send_response(&client->base, "+OK Please enter password\r\n");
 }
 
@@ -346,12 +366,20 @@ static void handle_pass(Pop3Client *client, const char *password)
         
         struct stat st;
         if (stat(client->maildir_path, &st) < 0 || !S_ISDIR(st.st_mode)) {
-            snprintf(client->maildir_path, sizeof(client->maildir_path),
+            int n = snprintf(client->maildir_path, sizeof(client->maildir_path),
                      "%s/%s", g_config.maildir_base, client->base.username);
+            if (n < 0 || (size_t)n >= sizeof(client->maildir_path)) {
+                send_response(&client->base, "-ERR Maildir path too long\r\n");
+                return;
+            }
         }
     } else {
-        snprintf(client->maildir_path, sizeof(client->maildir_path),
+        int n = snprintf(client->maildir_path, sizeof(client->maildir_path),
                  "%s/%s", g_config.maildir_base, client->base.username);
+        if (n < 0 || (size_t)n >= sizeof(client->maildir_path)) {
+            send_response(&client->base, "-ERR Maildir path too long\r\n");
+            return;
+        }
     }
     
     if (load_maildir(client) < 0) {
@@ -577,10 +605,16 @@ static void handle_uidl(Pop3Client *client, const char *arg)
 static void handle_top(Pop3Client *client, const char *arg)
 {
     char path[PATH_MAX];
-    FILE *fp;
+    FILE *fp = NULL;
     char line[BUFFER_SIZE];
     int in_headers = 1;
     int lines_sent = 0;
+    char *msg_str = NULL;
+    char *endptr = NULL;
+    unsigned long idx = 0;
+    long nlines = 0;
+    Message *msg = NULL;
+    int result = -1;
     
     if (!client->base.authenticated) {
         send_response(&client->base, "-ERR Not authenticated\r\n");
@@ -592,46 +626,45 @@ static void handle_top(Pop3Client *client, const char *arg)
         return;
     }
     
-    char *msg_str = strdup(arg);
+    msg_str = strdup(arg);
+    if (!msg_str) {
+        send_response(&client->base, "-ERR Server error\r\n");
+        return;
+    }
+    
     char *lines_str = strchr(msg_str, ' ');
     if (!lines_str) {
-        free(msg_str);
         send_response(&client->base, "-ERR Line count required\r\n");
-        return;
+        goto cleanup;
     }
     *lines_str++ = '\0';
     
-    char *endptr;
-    unsigned long idx = strtoul(msg_str, &endptr, 10);
+    idx = strtoul(msg_str, &endptr, 10);
     if (*endptr != '\0' || idx == 0 || idx > client->nmsgs) {
-        free(msg_str);
         send_response(&client->base, "-ERR No such message\r\n");
-        return;
+        goto cleanup;
     }
     
-    long nlines = strtol(lines_str, &endptr, 10);
+    nlines = strtol(lines_str, &endptr, 10);
     if (*endptr != '\0' || nlines < 0) {
-        free(msg_str);
         send_response(&client->base, "-ERR Invalid line count\r\n");
-        return;
+        goto cleanup;
     }
     
-    Message *msg = client->msgs[idx - 1];
+    msg = client->msgs[idx - 1];
     if (msg->flags & F_DELE) {
-        free(msg_str);
         send_response(&client->base, "-ERR Message deleted\r\n");
-        return;
+        goto cleanup;
     }
     
     snprintf(path, sizeof(path), "%s/cur/%s", client->maildir_path, msg->filename);
     fp = fopen(path, "r");
     if (!fp) {
-        free(msg_str);
         send_response(&client->base, "-ERR Cannot open message\r\n");
-        return;
+        goto cleanup;
     }
     
-    free(msg_str);
+    result = 0;
     send_response(&client->base, "+OK Top of message follows\r\n");
     
     while (fgets(line, sizeof(line), fp) && lines_sent < nlines) {
@@ -659,9 +692,13 @@ static void handle_top(Pop3Client *client, const char *arg)
             send_response(&client->base, line);
         }
     }
-    
-    fclose(fp);
-    send_response(&client->base, ".\r\n");
+
+cleanup:
+    if (fp) fclose(fp);
+    free(msg_str);
+    if (result == 0) {
+        send_response(&client->base, ".\r\n");
+    }
 }
 
 static void handle_stls(Pop3Client *client)

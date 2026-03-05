@@ -42,6 +42,7 @@
 #include <openssl/evp.h>
 #include <openssl/rsa.h>
 #include <openssl/bn.h>
+#include <openssl/x509v3.h>
 
 /* Check for PAM headers */
 #if defined(__has_include)
