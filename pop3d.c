@@ -6,60 +6,140 @@
 #include <dirent.h>
 #include <grp.h>
 
+/* ============================================================================
+ * POP3 specific constants
+ * ============================================================================ */
 #define POP3_MAX_LOGIN_ATTEMPTS	3
 #define POP3_MAX_MAILDIR_PATH	PATH_MAX
 
 /* Message flags */
-#define F_DELE		0x01
+#define F_DELE			0x01
 
-/* Message structure for maildir */
-typedef struct msg {
+/* ============================================================================
+ * Message structure for maildir
+ * ============================================================================ */
+typedef struct Message {
     char		*filename;
     size_t		size;
     size_t		nlines;
     int			flags;
 } Message;
 
-/* POP3 Client structure - extends ClientBase */
-typedef struct {
+/* ============================================================================
+ * POP3 Client structure - extends ClientBase
+ * ============================================================================ */
+typedef struct Pop3Client {
     ClientBase		base;
     int			login_attempts;
-    
-    /* Maildir state */
     char		maildir_path[POP3_MAX_MAILDIR_PATH];
     Message		**msgs;
     size_t		nmsgs;
     size_t		maildrop_size;
 } Pop3Client;
 
-static Pop3Client clients[MAX_CLIENTS];
-static int server_socket = -1, ssl_server_socket = -1;
-static int server6_socket = -1, ssl_server6_socket = -1;
+/* ============================================================================
+ * Forward declarations
+ * ============================================================================ */
+static void pop3_client_init(void *client);
+static int pop3_is_slot_free(void *client);
+static void pop3_send_greeting(ClientBase *client);
+static int pop3_process_data(void *client);
+static int pop3_get_timeout(void *client);
+static void pop3_handle_timeout(void *client);
+static void pop3_cleanup(void *client);
 
-/* Forward declarations */
 static void free_maildrop(Pop3Client *client);
 static int load_maildir(Pop3Client *client);
 static int update_maildir(Pop3Client *client);
-static void handle_client_data(Pop3Client *client);
+
+static void handle_user(Pop3Client *client, const char *username);
+static void handle_pass(Pop3Client *client, const char *password);
+static void handle_stat(Pop3Client *client);
+static void handle_list(Pop3Client *client, const char *arg);
+static void handle_retr(Pop3Client *client, const char *arg);
+static void handle_dele(Pop3Client *client, const char *arg);
+static void handle_rset(Pop3Client *client);
+static void handle_uidl(Pop3Client *client, const char *arg);
+static void handle_top(Pop3Client *client, const char *arg);
+static void handle_stls(Pop3Client *client);
+static void handle_capa(Pop3Client *client);
 static void process_command(Pop3Client *client, char *command);
 
-/* Maildir operations */
-static void free_maildrop(Pop3Client *client)
+/* ============================================================================
+ * Protocol handler
+ * ============================================================================ */
+static ProtocolHandler pop3_handler = {
+    .send_greeting = pop3_send_greeting,
+    .process_data = pop3_process_data,
+    .get_timeout = pop3_get_timeout,
+    .handle_timeout = pop3_handle_timeout,
+    .cleanup_client = pop3_cleanup
+};
+
+/* ============================================================================
+ * Client management callbacks
+ * ============================================================================ */
+static void pop3_client_init(void *client)
 {
-    if (client->msgs) {
-        for (size_t i = 0; i < client->nmsgs; i++) {
-            if (client->msgs[i]) {
-                free(client->msgs[i]->filename);
-                free(client->msgs[i]);
-            }
-        }
-        free(client->msgs);
-        client->msgs = NULL;
-    }
-    client->nmsgs = 0;
-    client->maildrop_size = 0;
+    Pop3Client *pop3 = (Pop3Client *)client;
+    memset(pop3, 0, sizeof(Pop3Client));
+    pop3->base.socket = -1;
 }
 
+static int pop3_is_slot_free(void *client)
+{
+    Pop3Client *pop3 = (Pop3Client *)client;
+    return pop3->base.socket == -1;
+}
+
+static void pop3_cleanup(void *client)
+{
+    Pop3Client *pop3 = (Pop3Client *)client;
+    free_maildrop(pop3);
+}
+
+static void pop3_send_greeting(ClientBase *client)
+{
+    send_response(client, "+OK POP3 server ready\r\n");
+}
+
+static int pop3_get_timeout(void *client)
+{
+    Pop3Client *pop3 = (Pop3Client *)client;
+    return pop3->base.authenticated ? 
+           g_config.timeout_command : g_config.timeout_login;
+}
+
+static void pop3_handle_timeout(void *client)
+{
+    Pop3Client *pop3 = (Pop3Client *)client;
+    send_response(&pop3->base, "-ERR Timeout\r\n");
+}
+
+/* ============================================================================
+ * Data processing
+ * ============================================================================ */
+static int pop3_process_data(void *client)
+{
+    Pop3Client *pop3 = (Pop3Client *)client;
+    char buffer[BUFFER_SIZE];
+    int bytes;
+    
+    bytes = receive_data(&pop3->base, buffer, sizeof(buffer));
+    
+    if (bytes <= 0) {
+        if (bytes < 0 && errno == EAGAIN) return 0;
+        return -1; /* Connection closed or error */
+    }
+    
+    buffer[bytes] = '\0';
+    process_command(pop3, buffer);
+    return 0;
+}
+
+/* ============================================================================
+ * Maildir operations
+ * ============================================================================ */
 static int count_lines(const char *path)
 {
     FILE *fp = fopen(path, "r");
@@ -102,6 +182,22 @@ static int move_new_to_cur(const char *maildir)
     return 0;
 }
 
+static void free_maildrop(Pop3Client *client)
+{
+    if (client->msgs) {
+        for (size_t i = 0; i < client->nmsgs; i++) {
+            if (client->msgs[i]) {
+                free(client->msgs[i]->filename);
+                free(client->msgs[i]);
+            }
+        }
+        free(client->msgs);
+        client->msgs = NULL;
+    }
+    client->nmsgs = 0;
+    client->maildrop_size = 0;
+}
+
 static int load_maildir(Pop3Client *client)
 {
     char cur_path[PATH_MAX];
@@ -113,7 +209,6 @@ static int load_maildir(Pop3Client *client)
     size_t total_size = 0;
     
     free_maildrop(client);
-    
     move_new_to_cur(client->maildir_path);
     
     snprintf(cur_path, sizeof(cur_path), "%s/cur", client->maildir_path);
@@ -186,7 +281,9 @@ static int update_maildir(Pop3Client *client)
     return deleted;
 }
 
-/* POP3 command handlers */
+/* ============================================================================
+ * POP3 command handlers
+ * ============================================================================ */
 static void handle_user(Pop3Client *client, const char *username)
 {
     if (!validate_input(username, MAX_LINE_LENGTH)) {
@@ -656,7 +753,7 @@ static void process_command(Pop3Client *client, char *command)
         }
         send_response(&client->base, "+OK POP3 server signing off\r\n");
         log_connection("QUIT", client->base.client_ip, client->base.socket);
-        client->base.socket = -1;
+        client->base.socket = -1; /* Signal to close connection */
     } else if (strcasecmp(cmd, "UIDL") == 0) {
         handle_uidl(client, arg);
     } else if (strcasecmp(cmd, "TOP") == 0) {
@@ -670,136 +767,9 @@ static void process_command(Pop3Client *client, char *command)
     }
 }
 
-static void check_timeouts(void)
-{
-    time_t now = time(NULL);
-    
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].base.socket == -1) continue;
-        
-        time_t timeout = clients[i].base.authenticated ?
-                         g_config.timeout_command : g_config.timeout_login;
-        
-        if (now - clients[i].base.last_activity > timeout) {
-            int sock = clients[i].base.socket;
-            send_response(&clients[i].base, "-ERR Timeout\r\n");
-            log_connection("Timeout", clients[i].base.client_ip, sock);
-            if (clients[i].base.ssl) {
-                SSL_shutdown(clients[i].base.ssl);
-                SSL_free(clients[i].base.ssl);
-                clients[i].base.ssl = NULL;
-            }
-            close(sock);
-            free_maildrop(&clients[i]);
-            memset(&clients[i], 0, sizeof(Pop3Client));
-            clients[i].base.socket = -1;
-        }
-    }
-}
-
-static Pop3Client* accept_connection(int server_fd, int is_ssl, int is_ipv6)
-{
-    struct sockaddr_storage client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_socket;
-    Pop3Client *client = NULL;
-    int slot = -1;
-    
-    client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-    if (client_socket < 0) {
-        if (errno != EINTR && errno != EAGAIN)
-            log_error("Accept failed: %s", strerror(errno));
-        return NULL;
-    }
-    
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].base.socket == -1) {
-            slot = i;
-            break;
-        }
-    }
-    
-    if (slot == -1) {
-        const char *msg = "-ERR Server busy\r\n";
-        send(client_socket, msg, strlen(msg), MSG_NOSIGNAL);
-        close(client_socket);
-        log_security("Connection limit reached", "unknown", NULL);
-        return NULL;
-    }
-    
-    client = &clients[slot];
-    memset(client, 0, sizeof(Pop3Client));
-    client->base.socket = client_socket;
-    client->base.last_activity = time(NULL);
-    
-    if (is_ipv6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&client_addr;
-        inet_ntop(AF_INET6, &sin6->sin6_addr, client->base.client_ip,
-                  sizeof(client->base.client_ip));
-    } else {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&client_addr;
-        inet_ntop(AF_INET, &sin->sin_addr, client->base.client_ip,
-                  sizeof(client->base.client_ip));
-    }
-    
-    log_connection("New connection", client->base.client_ip, client_socket);
-    
-    if (is_ssl) {
-        client->base.ssl = SSL_new(g_ctx.ssl_ctx);
-        if (!client->base.ssl) {
-            close(client_socket);
-            client->base.socket = -1;
-            return NULL;
-        }
-        
-        SSL_set_fd(client->base.ssl, client_socket);
-        
-        if (SSL_accept(client->base.ssl) <= 0) {
-            log_security("SSL handshake failed", client->base.client_ip, NULL);
-            SSL_free(client->base.ssl);
-            close(client_socket);
-            client->base.socket = -1;
-            return NULL;
-        }
-        
-        client->base.using_ssl = 1;
-        log_connection("SSL connection established",
-                       client->base.client_ip, client_socket);
-    }
-    
-    send_response(&client->base, "+OK POP3 server ready\r\n");
-    return client;
-}
-
-static void handle_client_data(Pop3Client *client)
-{
-    char buffer[BUFFER_SIZE];
-    int bytes;
-    int sock;
-    
-    bytes = receive_data(&client->base, buffer, sizeof(buffer));
-    
-    if (bytes <= 0) {
-        if (bytes < 0 && errno == EAGAIN) return;
-        
-        sock = client->base.socket;
-        log_connection("Client disconnected", client->base.client_ip, sock);
-        if (client->base.ssl) {
-            SSL_shutdown(client->base.ssl);
-            SSL_free(client->base.ssl);
-            client->base.ssl = NULL;
-        }
-        close(sock);
-        free_maildrop(client);
-        memset(client, 0, sizeof(Pop3Client));
-        client->base.socket = -1;
-        return;
-    }
-    
-    buffer[bytes] = '\0';
-    process_command(client, buffer);
-}
-
+/* ============================================================================
+ * Main entry point
+ * ============================================================================ */
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [options]\n", prog);
@@ -816,10 +786,8 @@ int main(int argc, char *argv[])
     int foreground = 0;
     int gen_cert = 0;
     const char *config_file = CONFIG_FILE;
-    fd_set read_fds;
-    int max_fd;
-    time_t last_timeout_check = 0;
-    struct timeval tv;
+    MailServer server;
+    ClientPool *pool;
     
     /* Set service-specific context */
     g_ctx.service_name = "pop3d";
@@ -868,30 +836,29 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        clients[i].base.socket = -1;
+    /* Create client pool */
+    pool = pool_create(sizeof(Pop3Client), MAX_CLIENTS, 
+                       pop3_is_slot_free, pop3_client_init);
+    if (!pool) {
+        log_error("Failed to create client pool");
+        cleanup_ssl();
+        return 1;
     }
     
-    server_socket = create_server_socket(g_config.pop3_port, 0);
-    if (server_socket < 0) {
-        log_error("Failed to create IPv4 server socket on port %d",
-                  g_config.pop3_port);
-    }
+    /* Initialize server */
+    server_init(&server, pool, &pop3_handler);
     
-    ssl_server_socket = create_server_socket(g_config.pop3s_port, 0);
-    if (ssl_server_socket < 0) {
-        log_error("Failed to create SSL server socket on port %d",
-                  g_config.pop3s_port);
-    }
-    
+    /* Add server sockets */
+    ss_add_socket(&server.ss_set, g_config.pop3_port, 0, 0, "POP3");
+    ss_add_socket(&server.ss_set, g_config.pop3s_port, 0, 1, "POP3S");
     if (g_config.ipv6_enabled) {
-        server6_socket = create_server_socket(g_config.pop3_port, 1);
-        ssl_server6_socket = create_server_socket(g_config.pop3s_port, 1);
+        ss_add_socket(&server.ss_set, g_config.pop3_port, 1, 0, "POP3-IPv6");
+        ss_add_socket(&server.ss_set, g_config.pop3s_port, 1, 1, "POP3S-IPv6");
     }
     
-    if (server_socket < 0 && ssl_server_socket < 0 &&
-        server6_socket < 0 && ssl_server6_socket < 0) {
+    if (server.ss_set.count == 0) {
         log_error("Failed to create any server sockets");
+        pool_destroy(pool);
         cleanup_ssl();
         return 1;
     }
@@ -901,86 +868,13 @@ int main(int argc, char *argv[])
     syslog(LOG_INFO, "pop3d ready - POP3 port %d, POP3S port %d",
            g_config.pop3_port, g_config.pop3s_port);
     
-    while (g_ctx.running) {
-        FD_ZERO(&read_fds);
-        max_fd = -1;
-        
-        if (server_socket >= 0) {
-            FD_SET(server_socket, &read_fds);
-            if (server_socket > max_fd) max_fd = server_socket;
-        }
-        if (ssl_server_socket >= 0) {
-            FD_SET(ssl_server_socket, &read_fds);
-            if (ssl_server_socket > max_fd) max_fd = ssl_server_socket;
-        }
-        if (server6_socket >= 0) {
-            FD_SET(server6_socket, &read_fds);
-            if (server6_socket > max_fd) max_fd = server6_socket;
-        }
-        if (ssl_server6_socket >= 0) {
-            FD_SET(ssl_server6_socket, &read_fds);
-            if (ssl_server6_socket > max_fd) max_fd = ssl_server6_socket;
-        }
-        
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].base.socket >= 0) {
-                FD_SET(clients[i].base.socket, &read_fds);
-                if (clients[i].base.socket > max_fd)
-                    max_fd = clients[i].base.socket;
-            }
-        }
-        
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-        
-        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            log_error("select error: %s", strerror(errno));
-            break;
-        }
-        
-        time_t now = time(NULL);
-        if (now - last_timeout_check >= 30) {
-            check_timeouts();
-            last_timeout_check = now;
-        }
-        
-        if (server_socket >= 0 && FD_ISSET(server_socket, &read_fds))
-            accept_connection(server_socket, 0, 0);
-        if (ssl_server_socket >= 0 && FD_ISSET(ssl_server_socket, &read_fds))
-            accept_connection(ssl_server_socket, 1, 0);
-        if (server6_socket >= 0 && FD_ISSET(server6_socket, &read_fds))
-            accept_connection(server6_socket, 0, 1);
-        if (ssl_server6_socket >= 0 && FD_ISSET(ssl_server6_socket, &read_fds))
-            accept_connection(ssl_server6_socket, 1, 1);
-        
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].base.socket >= 0 &&
-                FD_ISSET(clients[i].base.socket, &read_fds)) {
-                handle_client_data(&clients[i]);
-            }
-        }
-    }
+    /* Run server */
+    server_run(&server);
     
     syslog(LOG_INFO, "pop3d shutting down");
     
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].base.socket >= 0) {
-            if (clients[i].base.ssl) {
-                SSL_shutdown(clients[i].base.ssl);
-                SSL_free(clients[i].base.ssl);
-            }
-            close(clients[i].base.socket);
-            free_maildrop(&clients[i]);
-        }
-    }
-    
-    if (server_socket >= 0) close(server_socket);
-    if (ssl_server_socket >= 0) close(ssl_server_socket);
-    if (server6_socket >= 0) close(server6_socket);
-    if (ssl_server6_socket >= 0) close(ssl_server6_socket);
-    
+    server_shutdown(&server);
+    pool_destroy(pool);
     cleanup_ssl();
     closelog();
     

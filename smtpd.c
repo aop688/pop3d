@@ -7,11 +7,15 @@
 #include <grp.h>
 #include <sys/wait.h>
 
+/* ============================================================================
+ * SMTP specific constants
+ * ============================================================================ */
 #define SMTP_MAX_RCPT		100
-#define SMTP_MAX_MSG_SIZE	(50 * 1024 * 1024)
 #define SMTP_MAX_FAILED_RCPTS	5
 
-/* SMTP states */
+/* ============================================================================
+ * SMTP states
+ * ============================================================================ */
 typedef enum {
     STATE_CONNECTED,
     STATE_HELO,
@@ -21,16 +25,20 @@ typedef enum {
     STATE_QUIT
 } SmtpState;
 
-/* Recipient structure */
-typedef struct {
+/* ============================================================================
+ * Recipient structure
+ * ============================================================================ */
+typedef struct Recipient {
     char address[256];
     char user[128];
     char domain[128];
     int is_local;
 } Recipient;
 
-/* SMTP Client structure - extends ClientBase */
-typedef struct {
+/* ============================================================================
+ * SMTP Client structure - extends ClientBase
+ * ============================================================================ */
+typedef struct SmtpClient {
     ClientBase		base;
     SmtpState		state;
     char		helo[256];
@@ -41,20 +49,124 @@ typedef struct {
     int			data_fd;
     char		data_path[PATH_MAX];
     size_t		msg_size;
+    int			auth_login_state;
 } SmtpClient;
 
-static SmtpClient clients[MAX_CLIENTS];
-static int server_socket = -1, ssl_server_socket = -1;
-static int server6_socket = -1, ssl_server6_socket = -1;
-static int submission_socket = -1, submission6_socket = -1;
+/* ============================================================================
+ * Forward declarations
+ * ============================================================================ */
+static void smtp_client_init(void *client);
+static int smtp_is_slot_free(void *client);
+static void smtp_send_greeting(ClientBase *client);
+static int smtp_process_data(void *client);
+static int smtp_get_timeout(void *client);
+static void smtp_handle_timeout(void *client);
+static void smtp_cleanup(void *client);
 
-/* Forward declarations */
 static void reset_client(SmtpClient *client);
-static void handle_client_data(SmtpClient *client);
-static void process_command(SmtpClient *client, char *line);
 static int deliver_to_maildir(const char *user, int fd, const char *data_path);
+static int get_maildir_path(const char *user, char *path, size_t path_size);
+static int create_maildir(const char *path);
+static int is_local_domain(const char *domain);
 
-/* Utility functions */
+static void handle_ehlo(SmtpClient *client, const char *arg);
+static void handle_helo(SmtpClient *client, const char *arg);
+static void handle_mail(SmtpClient *client, const char *arg);
+static void handle_rcpt(SmtpClient *client, const char *arg);
+static void handle_data(SmtpClient *client);
+static void handle_data_content(SmtpClient *client, const char *line);
+static void handle_rset(SmtpClient *client);
+static void handle_auth(SmtpClient *client, const char *arg);
+static void handle_auth_plain(SmtpClient *client, const char *params);
+static void handle_auth_login_user(SmtpClient *client, const char *line);
+static void handle_auth_login_pass(SmtpClient *client, const char *line);
+static void handle_starttls(SmtpClient *client);
+static void handle_noop(SmtpClient *client);
+static void handle_vrfy(SmtpClient *client, const char *arg);
+static void handle_help(SmtpClient *client);
+static void handle_quit(SmtpClient *client);
+static void process_command(SmtpClient *client, char *line);
+
+/* ============================================================================
+ * Protocol handler
+ * ============================================================================ */
+static ProtocolHandler smtp_handler = {
+    .send_greeting = smtp_send_greeting,
+    .process_data = smtp_process_data,
+    .get_timeout = smtp_get_timeout,
+    .handle_timeout = smtp_handle_timeout,
+    .cleanup_client = smtp_cleanup
+};
+
+/* ============================================================================
+ * Client management callbacks
+ * ============================================================================ */
+static void smtp_client_init(void *client)
+{
+    SmtpClient *smtp = (SmtpClient *)client;
+    memset(smtp, 0, sizeof(SmtpClient));
+    smtp->base.socket = -1;
+    smtp->data_fd = -1;
+    smtp->state = STATE_CONNECTED;
+}
+
+static int smtp_is_slot_free(void *client)
+{
+    SmtpClient *smtp = (SmtpClient *)client;
+    return smtp->base.socket == -1;
+}
+
+static void smtp_cleanup(void *client)
+{
+    SmtpClient *smtp = (SmtpClient *)client;
+    reset_client(smtp);
+}
+
+static void smtp_send_greeting(ClientBase *client)
+{
+    char greeting[256];
+    snprintf(greeting, sizeof(greeting), "220 %s ESMTP\r\n", g_config.hostname);
+    send_response(client, greeting);
+}
+
+static int smtp_get_timeout(void *client)
+{
+    SmtpClient *smtp = (SmtpClient *)client;
+    if (smtp->state == STATE_DATA) {
+        return g_config.timeout_data;
+    }
+    return smtp->base.authenticated ? 
+           g_config.timeout_command : g_config.timeout_login;
+}
+
+static void smtp_handle_timeout(void *client)
+{
+    SmtpClient *smtp = (SmtpClient *)client;
+    send_response(&smtp->base, "421 4.4.2 Timeout\r\n");
+}
+
+/* ============================================================================
+ * Data processing
+ * ============================================================================ */
+static int smtp_process_data(void *client)
+{
+    SmtpClient *smtp = (SmtpClient *)client;
+    char buffer[BUFFER_SIZE];
+    int bytes;
+    
+    bytes = receive_line(&smtp->base, buffer, sizeof(buffer));
+    
+    if (bytes <= 0) {
+        return -1; /* Connection closed or error */
+    }
+    
+    process_command(smtp, buffer);
+    return (smtp->state == STATE_QUIT || smtp->base.socket == -1) ? -1 : 0;
+}
+
+/* ============================================================================
+ * Utility functions
+ * ============================================================================ */
 static int is_local_domain(const char *domain)
 {
     return strcmp(domain, g_config.hostname) == 0;
@@ -122,6 +234,8 @@ static int deliver_to_maildir(const char *user, int fd, const char *data_path)
     char buffer[BUFFER_SIZE];
     ssize_t n;
     
+    (void)data_path;
+    
     if (get_maildir_path(user, maildir, sizeof(maildir)) < 0) {
         log_error("Cannot create maildir for %s", user);
         return -1;
@@ -137,30 +251,26 @@ static int deliver_to_maildir(const char *user, int fd, const char *data_path)
     snprintf(tmp_path, sizeof(tmp_path), "%s/tmp/%s", maildir, new_path);
     snprintf(dest_path, sizeof(dest_path), "%s/new/%s", maildir, new_path);
     
-    src_fd = open(data_path, O_RDONLY);
-    if (src_fd < 0) {
-        log_error("Cannot open temp file %s: %s", data_path, strerror(errno));
+    src_fd = fd;
+    if (lseek(src_fd, 0, SEEK_SET) < 0) {
+        log_error("Cannot seek temp file: %s", strerror(errno));
         return -1;
     }
     
     dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (dst_fd < 0) {
         log_error("Cannot create temp file %s: %s", tmp_path, strerror(errno));
-        close(src_fd);
         return -1;
     }
     
     while ((n = read(src_fd, buffer, sizeof(buffer))) > 0) {
         if (write(dst_fd, buffer, n) != n) {
             log_error("Write error to %s: %s", tmp_path, strerror(errno));
-            close(src_fd);
             close(dst_fd);
             unlink(tmp_path);
             return -1;
         }
     }
-    
-    close(src_fd);
     
     if (fsync(dst_fd) < 0) {
         log_error("fsync error on %s: %s", tmp_path, strerror(errno));
@@ -181,7 +291,9 @@ static int deliver_to_maildir(const char *user, int fd, const char *data_path)
     return 0;
 }
 
-/* Client management */
+/* ============================================================================
+ * Client management
+ * ============================================================================ */
 static void reset_client(SmtpClient *client)
 {
     client->state = STATE_HELO;
@@ -189,6 +301,7 @@ static void reset_client(SmtpClient *client)
     client->mail_from[0] = '\0';
     client->nrcpt = 0;
     memset(client->recipients, 0, sizeof(client->recipients));
+    client->auth_login_state = 0;
     
     if (client->data_fd >= 0) {
         close(client->data_fd);
@@ -203,7 +316,9 @@ static void reset_client(SmtpClient *client)
     client->msg_size = 0;
 }
 
-/* SMTP command handlers */
+/* ============================================================================
+ * SMTP command handlers
+ * ============================================================================ */
 static void handle_ehlo(SmtpClient *client, const char *arg)
 {
     if (!validate_input(arg, MAX_LINE_LENGTH)) {
@@ -710,7 +825,6 @@ static void process_command(SmtpClient *client, char *line)
 {
     char *cmd;
     char *arg;
-    static int auth_login_state = 0;
     
     if (!validate_input(line, MAX_LINE_LENGTH)) {
         send_response(&client->base,
@@ -727,12 +841,12 @@ static void process_command(SmtpClient *client, char *line)
         return;
     }
     
-    if (auth_login_state == 1) {
-        auth_login_state = 2;
+    if (client->auth_login_state == 1) {
+        client->auth_login_state = 2;
         handle_auth_login_user(client, line);
         return;
-    } else if (auth_login_state == 2) {
-        auth_login_state = 0;
+    } else if (client->auth_login_state == 2) {
+        client->auth_login_state = 0;
         handle_auth_login_pass(client, line);
         return;
     }
@@ -763,196 +877,55 @@ static void process_command(SmtpClient *client, char *line)
     
     if (strncasecmp(cmd, "AUTH", 4) == 0 && arg &&
         strncasecmp(arg, "LOGIN", 5) == 0) {
-        auth_login_state = 1;
+        client->auth_login_state = 1;
     }
     
     if (strcasecmp(cmd, "EHLO") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_ehlo(client, arg ? arg : "");
     } else if (strcasecmp(cmd, "HELO") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_helo(client, arg ? arg : "");
     } else if (strcasecmp(cmd, "MAIL") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_mail(client, arg);
     } else if (strcasecmp(cmd, "RCPT") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_rcpt(client, arg);
     } else if (strcasecmp(cmd, "DATA") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_data(client);
     } else if (strcasecmp(cmd, "RSET") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_rset(client);
     } else if (strcasecmp(cmd, "AUTH") == 0) {
         handle_auth(client, arg);
     } else if (strcasecmp(cmd, "STARTTLS") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_starttls(client);
     } else if (strcasecmp(cmd, "NOOP") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_noop(client);
     } else if (strcasecmp(cmd, "VRFY") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_vrfy(client, arg);
     } else if (strcasecmp(cmd, "HELP") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_help(client);
     } else if (strcasecmp(cmd, "QUIT") == 0) {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         handle_quit(client);
     } else {
-        auth_login_state = 0;
+        client->auth_login_state = 0;
         send_response(&client->base,
                       "500 5.5.2 Syntax error, command unrecognized\r\n");
         client->failed_commands++;
     }
 }
 
-static void check_timeouts(void)
-{
-    time_t now = time(NULL);
-    
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].base.socket == -1) continue;
-        
-        time_t timeout;
-        if (clients[i].state == STATE_DATA) {
-            timeout = g_config.timeout_data;
-        } else if (clients[i].base.authenticated) {
-            timeout = g_config.timeout_command;
-        } else {
-            timeout = g_config.timeout_login;
-        }
-        
-        if (now - clients[i].base.last_activity > timeout) {
-            int sock = clients[i].base.socket;
-            send_response(&clients[i].base, "421 4.4.2 Timeout\r\n");
-            log_connection("Timeout", clients[i].base.client_ip, sock);
-            if (clients[i].base.ssl) {
-                SSL_shutdown(clients[i].base.ssl);
-                SSL_free(clients[i].base.ssl);
-                clients[i].base.ssl = NULL;
-            }
-            close(sock);
-            reset_client(&clients[i]);
-            memset(&clients[i], 0, sizeof(SmtpClient));
-            clients[i].base.socket = -1;
-            clients[i].data_fd = -1;
-        }
-    }
-}
-
-static SmtpClient* accept_connection(int server_fd, int is_ssl, int is_ipv6)
-{
-    struct sockaddr_storage client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_socket;
-    SmtpClient *client = NULL;
-    int slot = -1;
-    
-    client_socket = accept(server_fd, (struct sockaddr *)&client_addr,
-                           &client_len);
-    if (client_socket < 0) {
-        if (errno != EINTR && errno != EAGAIN)
-            log_error("Accept failed: %s", strerror(errno));
-        return NULL;
-    }
-    
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].base.socket == -1) {
-            slot = i;
-            break;
-        }
-    }
-    
-    if (slot == -1) {
-        const char *msg = "421 4.7.0 Server busy\r\n";
-        send(client_socket, msg, strlen(msg), MSG_NOSIGNAL);
-        close(client_socket);
-        log_security("Connection limit reached", "unknown", NULL);
-        return NULL;
-    }
-    
-    client = &clients[slot];
-    memset(client, 0, sizeof(SmtpClient));
-    client->base.socket = client_socket;
-    client->data_fd = -1;
-    client->base.last_activity = time(NULL);
-    client->state = STATE_CONNECTED;
-    
-    if (is_ipv6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&client_addr;
-        inet_ntop(AF_INET6, &sin6->sin6_addr, client->base.client_ip,
-                  sizeof(client->base.client_ip));
-    } else {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&client_addr;
-        inet_ntop(AF_INET, &sin->sin_addr, client->base.client_ip,
-                  sizeof(client->base.client_ip));
-    }
-    
-    log_connection("New connection", client->base.client_ip, client_socket);
-    
-    if (is_ssl) {
-        client->base.ssl = SSL_new(g_ctx.ssl_ctx);
-        if (!client->base.ssl) {
-            close(client_socket);
-            client->base.socket = -1;
-            return NULL;
-        }
-        
-        SSL_set_fd(client->base.ssl, client_socket);
-        
-        if (SSL_accept(client->base.ssl) <= 0) {
-            log_security("SSL handshake failed",
-                         client->base.client_ip, NULL);
-            SSL_free(client->base.ssl);
-            close(client_socket);
-            client->base.socket = -1;
-            return NULL;
-        }
-        
-        client->base.using_ssl = 1;
-        log_connection("SSL connection established",
-                       client->base.client_ip, client_socket);
-    }
-    
-    char greeting[256];
-    snprintf(greeting, sizeof(greeting), "220 %s ESMTP\r\n",
-             g_config.hostname);
-    send_response(&client->base, greeting);
-    
-    return client;
-}
-
-static void handle_client_data(SmtpClient *client)
-{
-    char buffer[BUFFER_SIZE];
-    int bytes;
-    int sock;
-    
-    bytes = receive_line(&client->base, buffer, sizeof(buffer));
-    
-    if (bytes <= 0) {
-        sock = client->base.socket;
-        log_connection("Client disconnected",
-                       client->base.client_ip, sock);
-        if (client->base.ssl) {
-            SSL_shutdown(client->base.ssl);
-            SSL_free(client->base.ssl);
-            client->base.ssl = NULL;
-        }
-        close(sock);
-        reset_client(client);
-        memset(client, 0, sizeof(SmtpClient));
-        client->base.socket = -1;
-        client->data_fd = -1;
-        return;
-    }
-    
-    process_command(client, buffer);
-}
-
+/* ============================================================================
+ * Main entry point
+ * ============================================================================ */
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s [options]\n", prog);
@@ -970,10 +943,8 @@ int main(int argc, char *argv[])
     int foreground = 0;
     int gen_cert = 0;
     const char *config_file = CONFIG_FILE;
-    fd_set read_fds;
-    int max_fd;
-    time_t last_timeout_check = 0;
-    struct timeval tv;
+    MailServer server;
+    ClientPool *pool;
     
     /* Set service-specific context */
     g_ctx.service_name = "smtpd";
@@ -1022,39 +993,31 @@ int main(int argc, char *argv[])
         return 1;
     }
     
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        clients[i].base.socket = -1;
-        clients[i].data_fd = -1;
+    /* Create client pool */
+    pool = pool_create(sizeof(SmtpClient), MAX_CLIENTS,
+                       smtp_is_slot_free, smtp_client_init);
+    if (!pool) {
+        log_error("Failed to create client pool");
+        cleanup_ssl();
+        return 1;
     }
     
-    server_socket = create_server_socket(g_config.smtp_port, 0);
-    if (server_socket < 0) {
-        log_error("Failed to create IPv4 SMTP server socket on port %d",
-                  g_config.smtp_port);
-    }
+    /* Initialize server */
+    server_init(&server, pool, &smtp_handler);
     
-    ssl_server_socket = create_server_socket(g_config.smtps_port, 0);
-    if (ssl_server_socket < 0) {
-        log_error("Failed to create IPv4 SMTPS server socket on port %d",
-                  g_config.smtps_port);
-    }
-    
-    submission_socket = create_server_socket(g_config.submission_port, 0);
-    if (submission_socket < 0) {
-        log_error("Failed to create IPv4 submission server socket on port %d",
-                  g_config.submission_port);
-    }
-    
+    /* Add server sockets */
+    ss_add_socket(&server.ss_set, g_config.smtp_port, 0, 0, "SMTP");
+    ss_add_socket(&server.ss_set, g_config.smtps_port, 0, 1, "SMTPS");
+    ss_add_socket(&server.ss_set, g_config.submission_port, 0, 0, "Submission");
     if (g_config.ipv6_enabled) {
-        server6_socket = create_server_socket(g_config.smtp_port, 1);
-        ssl_server6_socket = create_server_socket(g_config.smtps_port, 1);
-        submission6_socket = create_server_socket(g_config.submission_port, 1);
+        ss_add_socket(&server.ss_set, g_config.smtp_port, 1, 0, "SMTP-IPv6");
+        ss_add_socket(&server.ss_set, g_config.smtps_port, 1, 1, "SMTPS-IPv6");
+        ss_add_socket(&server.ss_set, g_config.submission_port, 1, 0, "Submission-IPv6");
     }
     
-    if (server_socket < 0 && ssl_server_socket < 0 && submission_socket < 0 &&
-        server6_socket < 0 && ssl_server6_socket < 0 &&
-        submission6_socket < 0) {
+    if (server.ss_set.count == 0) {
         log_error("Failed to create any server sockets");
+        pool_destroy(pool);
         cleanup_ssl();
         return 1;
     }
@@ -1065,100 +1028,13 @@ int main(int argc, char *argv[])
            "SMTPS port %d",
            g_config.smtp_port, g_config.submission_port, g_config.smtps_port);
     
-    while (g_ctx.running) {
-        FD_ZERO(&read_fds);
-        max_fd = -1;
-        
-        if (server_socket >= 0) {
-            FD_SET(server_socket, &read_fds);
-            if (server_socket > max_fd) max_fd = server_socket;
-        }
-        if (ssl_server_socket >= 0) {
-            FD_SET(ssl_server_socket, &read_fds);
-            if (ssl_server_socket > max_fd) max_fd = ssl_server_socket;
-        }
-        if (submission_socket >= 0) {
-            FD_SET(submission_socket, &read_fds);
-            if (submission_socket > max_fd) max_fd = submission_socket;
-        }
-        if (server6_socket >= 0) {
-            FD_SET(server6_socket, &read_fds);
-            if (server6_socket > max_fd) max_fd = server6_socket;
-        }
-        if (ssl_server6_socket >= 0) {
-            FD_SET(ssl_server6_socket, &read_fds);
-            if (ssl_server6_socket > max_fd) max_fd = ssl_server6_socket;
-        }
-        if (submission6_socket >= 0) {
-            FD_SET(submission6_socket, &read_fds);
-            if (submission6_socket > max_fd) max_fd = submission6_socket;
-        }
-        
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].base.socket >= 0) {
-                FD_SET(clients[i].base.socket, &read_fds);
-                if (clients[i].base.socket > max_fd)
-                    max_fd = clients[i].base.socket;
-            }
-        }
-        
-        tv.tv_sec = 5;
-        tv.tv_usec = 0;
-        
-        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            log_error("select error: %s", strerror(errno));
-            break;
-        }
-        
-        time_t now = time(NULL);
-        if (now - last_timeout_check >= 30) {
-            check_timeouts();
-            last_timeout_check = now;
-        }
-        
-        if (server_socket >= 0 && FD_ISSET(server_socket, &read_fds))
-            accept_connection(server_socket, 0, 0);
-        if (ssl_server_socket >= 0 && FD_ISSET(ssl_server_socket, &read_fds))
-            accept_connection(ssl_server_socket, 1, 0);
-        if (submission_socket >= 0 && FD_ISSET(submission_socket, &read_fds))
-            accept_connection(submission_socket, 0, 0);
-        if (server6_socket >= 0 && FD_ISSET(server6_socket, &read_fds))
-            accept_connection(server6_socket, 0, 1);
-        if (ssl_server6_socket >= 0 && FD_ISSET(ssl_server6_socket, &read_fds))
-            accept_connection(ssl_server6_socket, 1, 1);
-        if (submission6_socket >= 0 && FD_ISSET(submission6_socket, &read_fds))
-            accept_connection(submission6_socket, 0, 1);
-        
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (clients[i].base.socket >= 0 &&
-                FD_ISSET(clients[i].base.socket, &read_fds)) {
-                handle_client_data(&clients[i]);
-            }
-        }
-    }
+    /* Run server */
+    server_run(&server);
     
     syslog(LOG_INFO, "smtpd shutting down");
     
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (clients[i].base.socket >= 0) {
-            if (clients[i].base.ssl) {
-                SSL_shutdown(clients[i].base.ssl);
-                SSL_free(clients[i].base.ssl);
-            }
-            close(clients[i].base.socket);
-            reset_client(&clients[i]);
-        }
-    }
-    
-    if (server_socket >= 0) close(server_socket);
-    if (ssl_server_socket >= 0) close(ssl_server_socket);
-    if (submission_socket >= 0) close(submission_socket);
-    if (server6_socket >= 0) close(server6_socket);
-    if (ssl_server6_socket >= 0) close(ssl_server6_socket);
-    if (submission6_socket >= 0) close(submission6_socket);
-    
+    server_shutdown(&server);
+    pool_destroy(pool);
     cleanup_ssl();
     closelog();
     

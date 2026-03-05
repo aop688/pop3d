@@ -4,7 +4,9 @@
 
 #include "mail_common.h"
 
-/* Global instances */
+/* ============================================================================
+ * Global instances
+ * ============================================================================ */
 GlobalConfig g_config = {
     .allow_plaintext = 0,
     .max_connections = 50,
@@ -27,7 +29,7 @@ GlobalConfig g_config = {
     .max_msg_size = 50 * 1024 * 1024,
     .hostname = "localhost",
     .relay_only = 0,
-    .timeout_data = 600,
+    .timeout_data = DATA_TIMEOUT,
     
     /* Timeouts */
     .timeout_login = LOGIN_TIMEOUT,
@@ -48,6 +50,9 @@ ServerContext g_ctx = {
     .protocol_name = "MAIL"
 };
 
+/* ============================================================================
+ * Authentication
+ * ============================================================================ */
 #if HAVE_PAM
 /* PAM conversation function */
 static int pam_conv_func(int num_msg, const struct pam_message **msg,
@@ -181,7 +186,9 @@ int authenticate_user(const char *username, const char *password, const char *se
 }
 #endif
 
-/* Logging functions */
+/* ============================================================================
+ * Logging functions
+ * ============================================================================ */
 void log_connection(const char *message, const char *client_ip, int socket)
 {
     if (g_config.log_auth) {
@@ -205,7 +212,9 @@ void log_error(const char *fmt, ...)
     va_end(ap);
 }
 
-/* SSL initialization */
+/* ============================================================================
+ * SSL initialization
+ * ============================================================================ */
 int init_ssl(const char *cert_file, const char *key_file)
 {
     SSL_library_init();
@@ -247,7 +256,9 @@ void cleanup_ssl(void)
     ERR_free_strings();
 }
 
-/* Network I/O with SSL support */
+/* ============================================================================
+ * Network I/O with SSL support
+ * ============================================================================ */
 int send_response(ClientBase *client, const char *response)
 {
     int len = strlen(response);
@@ -335,7 +346,9 @@ int receive_data(ClientBase *client, char *buffer, int size)
     return ret;
 }
 
-/* Input validation */
+/* ============================================================================
+ * Input validation
+ * ============================================================================ */
 int validate_input(const char *input, size_t max_len)
 {
     if (!input || strlen(input) > max_len)
@@ -349,7 +362,9 @@ int validate_input(const char *input, size_t max_len)
     return 1;
 }
 
-/* String utilities */
+/* ============================================================================
+ * String utilities
+ * ============================================================================ */
 void str_trim(char *str)
 {
     char *start = str;
@@ -391,7 +406,9 @@ int parse_email_address(const char *addr, char *user, size_t user_size,
     return 0;
 }
 
-/* Socket creation */
+/* ============================================================================
+ * Socket creation
+ * ============================================================================ */
 int create_server_socket(int port, int is_ipv6)
 {
     int fd, opt = 1;
@@ -446,7 +463,354 @@ int create_server_socket(int port, int is_ipv6)
     return fd;
 }
 
-/* Configuration parsing */
+/* ============================================================================
+ * Connection management (Refactored)
+ * ============================================================================ */
+
+void ss_init(ServerSocketSet *ss_set)
+{
+    memset(ss_set, 0, sizeof(ServerSocketSet));
+    for (int i = 0; i < SOCK_TYPE_MAX; i++) {
+        ss_set->sockets[i].fd = -1;
+    }
+}
+
+int ss_add_socket(ServerSocketSet *ss_set, int port, int is_ipv6, int is_ssl, const char *name)
+{
+    if (ss_set->count >= SOCK_TYPE_MAX) {
+        log_error("Too many server sockets");
+        return -1;
+    }
+    
+    int fd = create_server_socket(port, is_ipv6);
+    if (fd < 0) {
+        return -1;
+    }
+    
+    ServerSocket *sock = &ss_set->sockets[ss_set->count++];
+    sock->fd = fd;
+    sock->port = port;
+    sock->is_ipv6 = is_ipv6;
+    sock->is_ssl = is_ssl;
+    sock->name = name;
+    
+    return 0;
+}
+
+void ss_close_all(ServerSocketSet *ss_set)
+{
+    for (int i = 0; i < ss_set->count; i++) {
+        if (ss_set->sockets[i].fd >= 0) {
+            close(ss_set->sockets[i].fd);
+            ss_set->sockets[i].fd = -1;
+        }
+    }
+    ss_set->count = 0;
+}
+
+int ss_get_max_fd(ServerSocketSet *ss_set)
+{
+    int max_fd = -1;
+    for (int i = 0; i < ss_set->count; i++) {
+        if (ss_set->sockets[i].fd > max_fd) {
+            max_fd = ss_set->sockets[i].fd;
+        }
+    }
+    return max_fd;
+}
+
+void ss_build_fdset(ServerSocketSet *ss_set, fd_set *fds)
+{
+    FD_ZERO(fds);
+    for (int i = 0; i < ss_set->count; i++) {
+        if (ss_set->sockets[i].fd >= 0) {
+            FD_SET(ss_set->sockets[i].fd, fds);
+        }
+    }
+}
+
+int ss_accept_client(ServerSocketSet *ss_set, fd_set *fds, ClientBase *client)
+{
+    for (int i = 0; i < ss_set->count; i++) {
+        ServerSocket *sock = &ss_set->sockets[i];
+        if (sock->fd >= 0 && FD_ISSET(sock->fd, fds)) {
+            int is_ssl = sock->is_ssl;
+            int is_ipv6 = sock->is_ipv6;
+            
+            if (accept_client_connection(sock->fd, client, is_ssl, is_ipv6) == 0) {
+                return 1; /* Client accepted */
+            }
+            return -1; /* Accept failed */
+        }
+    }
+    return 0; /* No socket ready */
+}
+
+/* ============================================================================
+ * Client pool management
+ * ============================================================================ */
+ClientPool* pool_create(size_t client_size, int max_clients,
+                        int (*is_slot_free)(void *client),
+                        void (*init_client)(void *client))
+{
+    ClientPool *pool = calloc(1, sizeof(ClientPool));
+    if (!pool) return NULL;
+    
+    pool->clients = calloc(max_clients, client_size);
+    if (!pool->clients) {
+        free(pool);
+        return NULL;
+    }
+    
+    pool->client_size = client_size;
+    pool->max_clients = max_clients;
+    pool->is_slot_free = is_slot_free;
+    pool->init_client = init_client;
+    
+    /* Initialize all clients */
+    for (int i = 0; i < max_clients; i++) {
+        void *client = (char *)pool->clients + (i * client_size);
+        init_client(client);
+    }
+    
+    return pool;
+}
+
+void pool_destroy(ClientPool *pool)
+{
+    if (pool) {
+        free(pool->clients);
+        free(pool);
+    }
+}
+
+void* pool_find_free_slot(ClientPool *pool)
+{
+    for (int i = 0; i < pool->max_clients; i++) {
+        void *client = (char *)pool->clients + (i * pool->client_size);
+        if (pool->is_slot_free(client)) {
+            return client;
+        }
+    }
+    return NULL;
+}
+
+int pool_is_full(ClientPool *client)
+{
+    (void)client;
+    return 0; /* Handled by pool_find_free_slot returning NULL */
+}
+
+void pool_cleanup_all(ClientPool *pool, ProtocolHandler *handler)
+{
+    for (int i = 0; i < pool->max_clients; i++) {
+        void *client = (char *)pool->clients + (i * pool->client_size);
+        ClientBase *base = (ClientBase *)client;
+        if (base->socket >= 0) {
+            close_client_connection(base, handler, client);
+        }
+    }
+}
+
+/* ============================================================================
+ * Connection handling
+ * ============================================================================ */
+int accept_client_connection(int server_fd, ClientBase *client, int is_ssl, int is_ipv6)
+{
+    struct sockaddr_storage client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    int client_socket;
+    
+    client_socket = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+    if (client_socket < 0) {
+        if (errno != EINTR && errno != EAGAIN)
+            log_error("Accept failed: %s", strerror(errno));
+        return -1;
+    }
+    
+    memset(client, 0, sizeof(ClientBase));
+    client->socket = client_socket;
+    client->last_activity = time(NULL);
+    
+    if (is_ipv6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&client_addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, client->client_ip,
+                  sizeof(client->client_ip));
+    } else {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&client_addr;
+        inet_ntop(AF_INET, &sin->sin_addr, client->client_ip,
+                  sizeof(client->client_ip));
+    }
+    
+    log_connection("New connection", client->client_ip, client_socket);
+    
+    if (is_ssl) {
+        if (perform_ssl_handshake(client) < 0) {
+            close(client_socket);
+            client->socket = -1;
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+void close_client_connection(ClientBase *client, ProtocolHandler *handler, void *protocol_client)
+{
+    if (handler && handler->cleanup_client) {
+        handler->cleanup_client(protocol_client);
+    }
+    
+    if (client->ssl) {
+        SSL_shutdown(client->ssl);
+        SSL_free(client->ssl);
+        client->ssl = NULL;
+    }
+    
+    if (client->socket >= 0) {
+        close(client->socket);
+        client->socket = -1;
+    }
+}
+
+int perform_ssl_handshake(ClientBase *client)
+{
+    client->ssl = SSL_new(g_ctx.ssl_ctx);
+    if (!client->ssl) {
+        return -1;
+    }
+    
+    SSL_set_fd(client->ssl, client->socket);
+    
+    if (SSL_accept(client->ssl) <= 0) {
+        log_security("SSL handshake failed", client->client_ip, NULL);
+        SSL_free(client->ssl);
+        client->ssl = NULL;
+        return -1;
+    }
+    
+    client->using_ssl = 1;
+    log_connection("SSL connection established", client->client_ip, client->socket);
+    return 0;
+}
+
+int check_client_timeout(ClientBase *client, time_t now, int timeout_seconds)
+{
+    return (now - client->last_activity > timeout_seconds);
+}
+
+/* ============================================================================
+ * Main server loop
+ * ============================================================================ */
+int server_init(MailServer *server, ClientPool *pool, ProtocolHandler *handler)
+{
+    memset(server, 0, sizeof(MailServer));
+    server->pool = pool;
+    server->handler = handler;
+    ss_init(&server->ss_set);
+    return 0;
+}
+
+int server_run(MailServer *server)
+{
+    fd_set read_fds;
+    struct timeval tv;
+    int max_fd;
+    
+    while (g_ctx.running) {
+        /* Build fdset from server sockets */
+        ss_build_fdset(&server->ss_set, &read_fds);
+        max_fd = ss_get_max_fd(&server->ss_set);
+        
+        /* Add client sockets to fdset */
+        for (int i = 0; i < server->pool->max_clients; i++) {
+            void *client = (char *)server->pool->clients + (i * server->pool->client_size);
+            ClientBase *base = (ClientBase *)client;
+            if (base->socket >= 0) {
+                FD_SET(base->socket, &read_fds);
+                if (base->socket > max_fd)
+                    max_fd = base->socket;
+            }
+        }
+        
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        
+        int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            log_error("select error: %s", strerror(errno));
+            return -1;
+        }
+        
+        /* Check timeouts */
+        time_t now = time(NULL);
+        if (now - server->last_timeout_check >= 30) {
+            for (int i = 0; i < server->pool->max_clients; i++) {
+                void *client = (char *)server->pool->clients + (i * server->pool->client_size);
+                ClientBase *base = (ClientBase *)client;
+                if (base->socket >= 0) {
+                    int timeout = server->handler->get_timeout(client);
+                    if (check_client_timeout(base, now, timeout)) {
+                        if (server->handler->handle_timeout) {
+                            server->handler->handle_timeout(client);
+                        }
+                        int sock = base->socket;
+                        log_connection("Timeout", base->client_ip, sock);
+                        close_client_connection(base, server->handler, client);
+                        server->pool->init_client(client);
+                    }
+                }
+            }
+            server->last_timeout_check = now;
+        }
+        
+        /* Accept new connections */
+        ClientBase new_client;
+        int accept_result = ss_accept_client(&server->ss_set, &read_fds, &new_client);
+        if (accept_result == 1) {
+            void *slot = pool_find_free_slot(server->pool);
+            if (!slot) {
+                const char *busy_msg = "-ERR Server busy\r\n";
+                send(new_client.socket, busy_msg, strlen(busy_msg), MSG_NOSIGNAL);
+                close(new_client.socket);
+                log_security("Connection limit reached", new_client.client_ip, NULL);
+            } else {
+                memcpy(slot, &new_client, sizeof(ClientBase));
+                if (server->handler->send_greeting) {
+                    server->handler->send_greeting((ClientBase *)slot);
+                }
+            }
+        }
+        
+        /* Handle client data */
+        for (int i = 0; i < server->pool->max_clients; i++) {
+            void *client = (char *)server->pool->clients + (i * server->pool->client_size);
+            ClientBase *base = (ClientBase *)client;
+            if (base->socket >= 0 && FD_ISSET(base->socket, &read_fds)) {
+                int result = server->handler->process_data(client);
+                if (result < 0) {
+                    int sock = base->socket;
+                    log_connection("Client disconnected", base->client_ip, sock);
+                    close_client_connection(base, server->handler, client);
+                    server->pool->init_client(client);
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+
+void server_shutdown(MailServer *server)
+{
+    pool_cleanup_all(server->pool, server->handler);
+    ss_close_all(&server->ss_set);
+}
+
+/* ============================================================================
+ * Configuration parsing
+ * ============================================================================ */
 int parse_config(const char *filename)
 {
     FILE *fp = fopen(filename, "r");
@@ -535,7 +899,9 @@ int parse_config(const char *filename)
     return 0;
 }
 
-/* OpenSSL 3.0+ compatible key generation */
+/* ============================================================================
+ * Certificate generation
+ * ============================================================================ */
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
 #include <openssl/core_names.h>
 #include <openssl/param_build.h>
@@ -663,7 +1029,9 @@ cleanup:
     return ret;
 }
 
-/* Daemonization */
+/* ============================================================================
+ * Daemonization
+ * ============================================================================ */
 void daemonize(void)
 {
     pid_t pid;
@@ -703,7 +1071,9 @@ void daemonize(void)
     }
 }
 
-/* Signal handling */
+/* ============================================================================
+ * Signal handling
+ * ============================================================================ */
 void signal_handler(int sig)
 {
     (void)sig;
@@ -717,7 +1087,9 @@ void setup_signal_handlers(void)
     signal(SIGPIPE, SIG_IGN);
 }
 
-/* Utility */
+/* ============================================================================
+ * Utility
+ * ============================================================================ */
 int is_local_user(const char *user)
 {
     struct passwd *pw = getpwnam(user);
