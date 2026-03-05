@@ -50,13 +50,17 @@ This installs:
 
 ## Configuration
 
-### 1. Generate SSL Certificate
+### 1. Configure SSL Certificate
+
+Obtain SSL certificates from a Certificate Authority (e.g., Let's Encrypt) or use existing ones:
 
 ```bash
-sudo /usr/local/sbin/pop3d -g
+# Example: Using Let's Encrypt certificates
+sudo ln -s /etc/letsencrypt/live/mail.example.com/fullchain.pem /etc/ssl/certs/maild.crt
+sudo ln -s /etc/letsencrypt/live/mail.example.com/privkey.pem /etc/ssl/private/maild.key
 ```
 
-Or use Let's Encrypt:
+Or generate self-signed certificates using OpenSSL:
 ```bash
 # If you have certbot certificates
 sudo ln -s /etc/letsencrypt/live/mail.example.com/fullchain.pem /etc/ssl/certs/pop3d.crt
@@ -176,9 +180,8 @@ sudo pamtester pop3d your_username authenticate
 
 ```
 Usage: pop3d [options]
-  -c <file>    Configuration file (default: /etc/pop3d.conf)
+  -c <file>    Configuration file (default: /etc/maild.conf)
   -d           Run in foreground (debug mode)
-  -g           Generate self-signed certificate
   -h           Show help
 ```
 
@@ -245,8 +248,10 @@ sudo chmod 700 /var/mail/username
 openssl x509 -in /etc/ssl/certs/pop3d.crt -text -noout
 openssl rsa -in /etc/ssl/private/pop3d.key -check
 
-# Generate new certificate
-sudo pop3d -g
+# Generate new self-signed certificate using OpenSSL
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/maild.key \
+  -out /etc/ssl/certs/maild.crt
 ```
 
 ### Port already in use

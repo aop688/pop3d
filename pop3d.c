@@ -777,14 +777,13 @@ static void usage(const char *prog)
     fprintf(stderr, "  -c <file>    Configuration file (default: %s)\n", CONFIG_FILE);
     fprintf(stderr, "  -d           Run in foreground (don't daemonize)\n");
     fprintf(stderr, "  -h           Show this help\n");
-    fprintf(stderr, "  -g           Generate self-signed certificate\n");
+
 }
 
 int main(int argc, char *argv[])
 {
     int opt;
     int foreground = 0;
-    int gen_cert = 0;
     const char *config_file = CONFIG_FILE;
     MailServer server;
     ClientPool *pool;
@@ -793,16 +792,13 @@ int main(int argc, char *argv[])
     g_ctx.service_name = "pop3d";
     g_ctx.protocol_name = "POP3";
     
-    while ((opt = getopt(argc, argv, "c:dhg")) != -1) {
+    while ((opt = getopt(argc, argv, "c:dh")) != -1) {
         switch (opt) {
         case 'c':
             config_file = optarg;
             break;
         case 'd':
             foreground = 1;
-            break;
-        case 'g':
-            gen_cert = 1;
             break;
         case 'h':
         default:
@@ -812,11 +808,6 @@ int main(int argc, char *argv[])
     }
     
     parse_config(config_file);
-    
-    if (gen_cert) {
-        return generate_self_signed_cert(g_config.cert_file,
-                                          g_config.key_file, "pop3d");
-    }
     
     if (!g_config.pop3_enabled) {
         fprintf(stderr, "POP3 is disabled in configuration\n");

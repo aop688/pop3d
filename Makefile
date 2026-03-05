@@ -56,7 +56,7 @@ COMMON_OBJS	= mail_common.o
 POP3D_SRCS	= pop3d.c
 SMTPD_SRCS	= smtpd.c
 
-.PHONY: all clean install uninstall test cert check
+.PHONY: all clean install uninstall test check
 
 all: check $(POP3D_PROG) $(SMTPD_PROG)
 
@@ -108,12 +108,10 @@ else
 endif
 	@echo ""
 	@echo "Next steps:"
-	@echo "  1. Generate SSL certificates:"
-	@echo "     sudo $(DESTDIR)$(BINDIR)/$(POP3D_PROG) -g"
-	@echo "     sudo $(DESTDIR)$(BINDIR)/$(SMTPD_PROG) -g"
-	@echo "  2. Edit config:"
-	@echo "     sudo editor $(DESTDIR)$(SYSCONFDIR)/maild.conf"
-	@echo "  3. Start services:"
+	@echo "  1. Configure SSL certificates in $(DESTDIR)$(SYSCONFDIR)/maild.conf"
+	@echo "     cert_file = /path/to/your/certificate.crt"
+	@echo "     key_file = /path/to/your/private.key"
+	@echo "  2. Start services:"
 	@echo "     sudo systemctl enable --now pop3d"
 	@echo "     sudo systemctl enable --now smtpd"
 
@@ -127,10 +125,6 @@ uninstall:
 	rm -f $(DESTDIR)$(PAMDIR)/smtpd
 	rm -f $(DESTDIR)$(SYSCONFDIR)/systemd/system/pop3d.service
 	rm -f $(DESTDIR)$(SYSCONFDIR)/systemd/system/smtpd.service
-
-cert: $(POP3D_PROG) $(SMTPD_PROG)
-	./$(POP3D_PROG) -g
-	./$(SMTPD_PROG) -g
 
 test: all
 	@echo "Testing POP3 and SMTP servers:"
