@@ -1,0 +1,6 @@
+# PAM configuration for smtpd
+# Standard Unix authentication
+
+@include common-auth
+@include common-account
+@include common-session

@@ -1,0 +1,68 @@
+.TH SMTPD 8 "December 2024" "smtpd" "System Administration"
+.SH NAME
+smtpd \- Simple Mail Transfer Protocol server
+.SH SYNOPSIS
+.B smtpd
+[\fI\,options\/\fR]
+.SH DESCRIPTION
+.B smtpd
+is a production-ready SMTP server designed for Linux systems.
+It supports mail submission, delivery to maildir format,
+authentication via PAM or shadow passwords, and TLS encryption.
+.SH OPTIONS
+.TP
+.B \-c \fI\,file\/
+fR
+Specify configuration file (default: /etc/smtpd.conf)
+.TP
+.B \-d
+Run in foreground (don't daemonize)
+.TP
+.B \-g
+Generate self-signed SSL certificate
+.TP
+.B \-h
+Display help and exit
+.SH CONFIGURATION
+The configuration file uses the format \fBkey = value\fR.
+See \fBsmtpd.conf\fR(5) for details.
+.SH FILES
+.TP
+.I /etc/smtpd.conf
+Default configuration file
+.TP
+.I /etc/pam.d/smtpd
+PAM authentication configuration
+.TP
+.I /etc/ssl/certs/smtpd.crt
+Default SSL certificate
+.TP
+.I /etc/ssl/private/smtpd.key
+Default SSL private key
+.TP
+.I /var/mail
+Default mail spool directory
+.SH FEATURES
+.IP \(bu 2
+SMTP (port 25), Submission (port 587), and SMTPS (port 465)
+.IP \(bu 2
+IPv4 and IPv6 support
+.IP \(bu 2
+STARTTLS and implicit TLS
+.IP \(bu 2
+AUTH PLAIN and AUTH LOGIN
+.IP \(bu 2
+PAM or shadow password authentication
+.IP \(bu 2
+Maildir format delivery
+.IP \(bu 2
+Message size limits
+.SH SECURITY
+Always use TLS in production. Set \fBallow_plaintext = 0\fR in
+configuration to enforce encrypted connections.
+.SH SEE ALSO
+.BR pop3d (8),
+.BR smtpd.conf (5),
+.BR pam (8)
+.SH AUTHOR
+Production SMTP Server

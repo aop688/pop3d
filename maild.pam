@@ -1,0 +1,7 @@
+# PAM configuration for maild services (pop3d and smtpd)
+# Unified authentication configuration
+
+# Standard Unix authentication
+@include common-auth
+@include common-account
+@include common-session
