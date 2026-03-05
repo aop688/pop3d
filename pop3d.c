@@ -125,16 +125,16 @@ static int pop3_process_data(void *client)
     char buffer[BUFFER_SIZE];
     int bytes;
     
-    bytes = receive_data(&pop3->base, buffer, sizeof(buffer));
+    /* POP3 is a line-based protocol, must use receive_line */
+    bytes = receive_line(&pop3->base, buffer, sizeof(buffer));
     
     if (bytes <= 0) {
-        if (bytes < 0 && errno == EAGAIN) return 0;
         return -1; /* Connection closed or error */
     }
     
-    buffer[bytes] = '\0';
     process_command(pop3, buffer);
-    return 0;
+    /* QUIT command sets socket to -1 to signal disconnection */
+    return (pop3->base.socket == -1) ? -1 : 0;
 }
 
 /* ============================================================================

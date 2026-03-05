@@ -299,6 +299,9 @@ int receive_line(ClientBase *client, char *buffer, int size)
     int ret;
     int pos = 0;
     
+    if (size <= 0)
+        return -1;
+    
     memset(buffer, 0, size);
     
     while (pos < size - 1) {
@@ -330,7 +333,8 @@ int receive_line(ClientBase *client, char *buffer, int size)
         }
     }
     
-    return pos;
+    /* Buffer full but no CRLF found - line too long */
+    return -1;
 }
 
 int receive_data(ClientBase *client, char *buffer, int size)
@@ -389,12 +393,21 @@ void str_trim(char *str)
 int parse_email_address(const char *addr, char *user, size_t user_size,
                         char *domain, size_t domain_size)
 {
-    const char *at = strchr(addr, '@');
+    const char *at;
+    size_t ulen;
+    
+    if (!addr || !user || !domain)
+        return -1;
+    
+    at = strchr(addr, '@');
     if (!at)
         return -1;
     
-    size_t ulen = at - addr;
-    if (ulen >= user_size)
+    ulen = at - addr;
+    if (ulen == 0 || ulen >= user_size)
+        return -1;
+    
+    if (strlen(at + 1) == 0 || strlen(at + 1) >= domain_size)
         return -1;
     
     strncpy(user, addr, ulen);
@@ -657,20 +670,24 @@ int accept_client_connection(int server_fd, ClientBase *client, int is_ssl, int 
 
 void close_client_connection(ClientBase *client, ProtocolHandler *handler, void *protocol_client)
 {
+    /* Save socket fd early, as cleanup might modify the structure */
+    int sock = client->socket;
+    
     if (handler && handler->cleanup_client) {
         handler->cleanup_client(protocol_client);
     }
     
     if (client->ssl) {
+        /* SSL_shutdown requires the underlying socket to be open */
         SSL_shutdown(client->ssl);
         SSL_free(client->ssl);
         client->ssl = NULL;
     }
     
-    if (client->socket >= 0) {
-        close(client->socket);
-        client->socket = -1;
+    if (sock >= 0) {
+        close(sock);
     }
+    client->socket = -1;
 }
 
 int perform_ssl_handshake(ClientBase *client)

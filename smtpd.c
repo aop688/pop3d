@@ -229,10 +229,10 @@ static int deliver_to_maildir(const char *user, int fd, const char *data_path)
     char tmp_path[PATH_MAX];
     char dest_path[PATH_MAX];
     struct timeval tv;
-    struct stat st;
-    int src_fd, dst_fd;
+    int dst_fd;
     char buffer[BUFFER_SIZE];
     ssize_t n;
+    int retry_count = 0;
     
     (void)data_path;
     
@@ -241,35 +241,57 @@ static int deliver_to_maildir(const char *user, int fd, const char *data_path)
         return -1;
     }
     
-    gettimeofday(&tv, NULL);
-    pid_t pid = getpid();
-    
-    snprintf(new_path, sizeof(new_path), "%lu.%lu.%d.%s",
-             (unsigned long)tv.tv_sec, (unsigned long)tv.tv_usec,
-             (int)pid, g_config.hostname);
-    
-    snprintf(tmp_path, sizeof(tmp_path), "%s/tmp/%s", maildir, new_path);
-    snprintf(dest_path, sizeof(dest_path), "%s/new/%s", maildir, new_path);
-    
-    src_fd = fd;
-    if (lseek(src_fd, 0, SEEK_SET) < 0) {
+    if (lseek(fd, 0, SEEK_SET) < 0) {
         log_error("Cannot seek temp file: %s", strerror(errno));
         return -1;
     }
     
-    dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (dst_fd < 0) {
-        log_error("Cannot create temp file %s: %s", tmp_path, strerror(errno));
+    /* Retry loop for unique filename generation */
+    while (retry_count < 10) {
+        gettimeofday(&tv, NULL);
+        pid_t pid = getpid();
+        
+        snprintf(new_path, sizeof(new_path), "%lu.%lu.%d.%s",
+                 (unsigned long)tv.tv_sec, (unsigned long)tv.tv_usec,
+                 (int)pid, g_config.hostname);
+        
+        snprintf(tmp_path, sizeof(tmp_path), "%s/tmp/%s", maildir, new_path);
+        snprintf(dest_path, sizeof(dest_path), "%s/new/%s", maildir, new_path);
+        
+        dst_fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (dst_fd >= 0) {
+            break;  /* Success */
+        }
+        
+        if (errno != EEXIST) {
+            log_error("Cannot create temp file %s: %s", tmp_path, strerror(errno));
+            return -1;
+        }
+        
+        /* File exists, retry with new timestamp */
+        retry_count++;
+        usleep(1000);  /* 1ms delay */
+    }
+    
+    if (retry_count >= 10) {
+        log_error("Cannot create unique temp file after 10 attempts");
         return -1;
     }
     
-    while ((n = read(src_fd, buffer, sizeof(buffer))) > 0) {
+    while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
         if (write(dst_fd, buffer, n) != n) {
             log_error("Write error to %s: %s", tmp_path, strerror(errno));
             close(dst_fd);
             unlink(tmp_path);
             return -1;
         }
+    }
+    
+    if (n < 0) {
+        log_error("Read error from temp file: %s", strerror(errno));
+        close(dst_fd);
+        unlink(tmp_path);
+        return -1;
     }
     
     if (fsync(dst_fd) < 0) {
@@ -589,6 +611,16 @@ static void handle_data_content(SmtpClient *client, const char *line)
                                client->base.socket);
                 delivered++;
             }
+            
+            /* Seek back to beginning for next recipient */
+            if (i < client->nrcpt - 1) {
+                if (lseek(final_fd, 0, SEEK_SET) < 0) {
+                    log_error("Cannot seek temp file for next recipient: %s",
+                              strerror(errno));
+                    failed += client->nrcpt - i - 1;
+                    break;
+                }
+            }
         }
         
         close(final_fd);
@@ -702,6 +734,10 @@ static void handle_auth(SmtpClient *client, const char *arg)
     if (strcasecmp(mech, "PLAIN") == 0) {
         handle_auth_plain(client, params);
     } else if (strcasecmp(mech, "LOGIN") == 0) {
+        /* Only set auth state if no inline parameter provided */
+        if (!params) {
+            client->auth_login_state = 1;
+        }
         send_response(&client->base, "334 VXNlcm5hbWU6\r\n");
         free(mech);
         return;
@@ -875,10 +911,7 @@ static void process_command(SmtpClient *client, char *line)
         log_connection(cmd, client->base.client_ip, client->base.socket);
     }
     
-    if (strncasecmp(cmd, "AUTH", 4) == 0 && arg &&
-        strncasecmp(arg, "LOGIN", 5) == 0) {
-        client->auth_login_state = 1;
-    }
+    /* AUTH LOGIN state is now set inside handle_auth when needed */
     
     if (strcasecmp(cmd, "EHLO") == 0) {
         client->auth_login_state = 0;
